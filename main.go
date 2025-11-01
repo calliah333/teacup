@@ -39,17 +39,17 @@ type Server struct {
 	password   string
 }
 
-func loadCredentials(configPath string) (string, string, error) {
-	var username, password string
+func loadCredentials(configPath string) (string, string, string, error) {
+	var username, password, port string
 
 	// Config file must exist
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return "", "", fmt.Errorf("config file not found at %s", configPath)
+		return "", "", "", fmt.Errorf("config file not found at %s", configPath)
 	}
 
 	file, err := os.Open(configPath)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to open config file: %w", err)
+		return "", "", "", fmt.Errorf("failed to open config file: %w", err)
 	}
 	defer file.Close()
 
@@ -75,22 +75,34 @@ func loadCredentials(configPath string) (string, string, error) {
 			username = value
 		case "password":
 			password = value
+		case "port":
+			port = value
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return "", "", fmt.Errorf("error reading config file: %w", err)
+		return "", "", "", fmt.Errorf("error reading config file: %w", err)
 	}
 
 	if username == "" {
-		return "", "", fmt.Errorf("username not found in config file")
+		return "", "", "", fmt.Errorf("username not found in config file")
 	}
 
 	if password == "" {
-		return "", "", fmt.Errorf("password not found in config file")
+		return "", "", "", fmt.Errorf("password not found in config file")
 	}
 
-	return username, password, nil
+	// Default port if not specified
+	if port == "" {
+		port = "8080"
+	}
+
+	// Normalize port format (ensure it starts with ":")
+	if !strings.HasPrefix(port, ":") {
+		port = ":" + port
+	}
+
+	return username, password, port, nil
 }
 
 func NewServer(uploadDir, baseURL string, ttl time.Duration, username, password string) (*Server, error) {
@@ -634,7 +646,7 @@ func main() {
 	// Load credentials from config file
 	configPath := "config"
 
-	username, password, err := loadCredentials(configPath)
+	username, password, port, err := loadCredentials(configPath)
 	if err != nil {
 		log.Fatal("Failed to load credentials:", err)
 	}
@@ -647,11 +659,10 @@ func main() {
 		log.Fatal("Failed to create upload directory:", err)
 	}
 
-	baseURL := "http://localhost:8080"
-	if baseEnv := os.Getenv("BASE_URL"); baseEnv != "" {
-		baseURL = baseEnv
-	}
 	ttl := 3 * time.Hour
+
+	// Construct baseURL using the port from config
+	baseURL := fmt.Sprintf("http://localhost%s", port)
 
 	server, err := NewServer(uploadDir, baseURL, ttl, username, password)
 	if err != nil {
@@ -667,7 +678,6 @@ func main() {
 	http.HandleFunc("/logout", server.logoutHandler)
 	http.HandleFunc("/check-auth", server.checkAuthHandler)
 
-	port := ":8080"
 	log.Printf("Server starting on %s", port)
 	log.Printf("Files will expire after %v", ttl)
 	log.Fatal(http.ListenAndServe(port, nil))

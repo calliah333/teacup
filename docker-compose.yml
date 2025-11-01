@@ -5,10 +5,7 @@ services:
       - "8080:8080"
     volumes:
       - ./uploads:/app/uploads
-      - ./config.txt:/app/config.txt
     environment:
-      - CONFIG_PATH=/app/config.txt
       - UPLOAD_DIR=/app/uploads
-      - BASE_URL=http://localhost:8080
     restart: unless-stopped
 

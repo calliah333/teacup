@@ -143,6 +143,9 @@
                             <p class="text-xs text-muted-foreground">
                                 Support for multiple files (max 100 MB per file)
                             </p>
+                            <p class="text-xs text-muted-foreground mt-2">
+                                You can also paste files from clipboard (Ctrl/Cmd+V)
+                            </p>
                         </div>
                     </div>
                     <input type="file" id="fileInput" name="files" multiple class="hidden">
@@ -295,6 +298,63 @@
         // Clear errors when files are selected
         fileInput.addEventListener('change', () => {
             fileSizeError.classList.add('hidden');
+        });
+
+        // Clipboard paste handler
+        document.addEventListener('paste', async (e) => {
+            // Only handle paste if user is authenticated and upload card is visible
+            if (!isAuthenticated || uploadCard.classList.contains('hidden')) {
+                return;
+            }
+
+            const items = e.clipboardData?.items;
+            if (!items) return;
+
+            const files = [];
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                // Check if the item is a file
+                if (item.kind === 'file') {
+                    const file = item.getAsFile();
+                    if (file) {
+                        files.push(file);
+                    }
+                }
+            }
+
+            if (files.length > 0) {
+                e.preventDefault();
+                
+                // Combine with existing files if any
+                const dt = new DataTransfer();
+                
+                // Add existing files
+                if (fileInput.files.length > 0) {
+                    for (let file of fileInput.files) {
+                        dt.items.add(file);
+                    }
+                }
+                
+                // Add pasted files
+                for (let file of files) {
+                    dt.items.add(file);
+                }
+                
+                fileInput.files = dt.files;
+                
+                // Automatically trigger upload
+                uploadForm.dispatchEvent(new Event('submit', { cancelable: true }));
+            }
+        });
+
+        // Add visual feedback when paste is ready
+        // Make the drop zone focusable to improve paste UX
+        dropZone.setAttribute('tabindex', '0');
+        dropZone.addEventListener('focus', () => {
+            dropZone.classList.add('ring-2', 'ring-ring', 'ring-offset-2');
+        });
+        dropZone.addEventListener('blur', () => {
+            dropZone.classList.remove('ring-2', 'ring-ring', 'ring-offset-2');
         });
 
         // Drag and drop handlers

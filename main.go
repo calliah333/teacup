@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -13,20 +16,84 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
+const (
+	maxFileSize = 100 << 20 // 100 MB per file
+	maxFormSize = 500 << 20 // 500 MB total form size (allows multiple files)
+)
+
 type Server struct {
-	db        *sql.DB
-	uploadDir string
-	baseURL   string
-	ttl       time.Duration
-	indexTmpl *template.Template
+	db         *sql.DB
+	uploadDir  string
+	baseURL    string
+	ttl        time.Duration
+	indexTmpl  *template.Template
+	sessions   map[string]time.Time
+	sessionsMu sync.RWMutex
+	username   string
+	password   string
 }
 
-func NewServer(uploadDir, baseURL string, ttl time.Duration) (*Server, error) {
+func loadCredentials(configPath string) (string, string, error) {
+	var username, password string
+
+	// Config file must exist
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return "", "", fmt.Errorf("config file not found at %s", configPath)
+	}
+
+	file, err := os.Open(configPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to open config file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse key=value format
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		switch strings.ToLower(key) {
+		case "username":
+			username = value
+		case "password":
+			password = value
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", "", fmt.Errorf("error reading config file: %w", err)
+	}
+
+	if username == "" {
+		return "", "", fmt.Errorf("username not found in config file")
+	}
+
+	if password == "" {
+		return "", "", fmt.Errorf("password not found in config file")
+	}
+
+	return username, password, nil
+}
+
+func NewServer(uploadDir, baseURL string, ttl time.Duration, username, password string) (*Server, error) {
 	tmpl, err := template.ParseFiles("index.html")
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse index.html: %w", err)
@@ -45,6 +112,9 @@ func NewServer(uploadDir, baseURL string, ttl time.Duration) (*Server, error) {
 		baseURL:   baseURL,
 		ttl:       ttl,
 		indexTmpl: tmpl,
+		sessions:  make(map[string]time.Time),
+		username:  strings.TrimSpace(username),
+		password:  strings.TrimSpace(password),
 	}
 
 	// Initialize database schema
@@ -57,6 +127,9 @@ func NewServer(uploadDir, baseURL string, ttl time.Duration) (*Server, error) {
 	if err := server.loadExistingFiles(); err != nil {
 		log.Printf("Warning: failed to load existing files: %v", err)
 	}
+
+	// Start session cleanup goroutine
+	go server.cleanupSessions()
 
 	return server, nil
 }
@@ -120,6 +193,153 @@ func (s *Server) generateHash(filename string) string {
 	return hex.EncodeToString(hash[:])[:8]
 }
 
+func (s *Server) generateSessionToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (s *Server) isValidSession(sessionToken string) bool {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	expiry, exists := s.sessions[sessionToken]
+	return exists && expiry.After(time.Now())
+}
+
+func (s *Server) createSession() (string, error) {
+	token, err := s.generateSessionToken()
+	if err != nil {
+		return "", err
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	s.sessions[token] = time.Now().Add(24 * time.Hour)
+	return token, nil
+}
+
+func (s *Server) deleteSession(sessionToken string) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	delete(s.sessions, sessionToken)
+}
+
+func (s *Server) cleanupSessions() {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.sessionsMu.Lock()
+		now := time.Now()
+		for token, expiry := range s.sessions {
+			if expiry.Before(now) {
+				delete(s.sessions, token)
+			}
+		}
+		s.sessionsMu.Unlock()
+	}
+}
+
+func (s *Server) getSessionToken(r *http.Request) string {
+	cookie, err := r.Cookie("session_token")
+	if err != nil {
+		return ""
+	}
+	return cookie.Value
+}
+
+func (s *Server) requireAuth(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionToken := s.getSessionToken(r)
+		if !s.isValidSession(sessionToken) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "Authentication required",
+			})
+			return
+		}
+		fn(w, r)
+	}
+}
+
+func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var creds struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	if creds.Username != s.username || creds.Password != s.password {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Invalid username or password",
+		})
+		return
+	}
+
+	sessionToken, err := s.createSession()
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_token",
+		Value:    sessionToken,
+		Path:     "/",
+		MaxAge:   86400, // 24 hours
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+func (s *Server) logoutHandler(w http.ResponseWriter, r *http.Request) {
+	sessionToken := s.getSessionToken(r)
+	if sessionToken != "" {
+		s.deleteSession(sessionToken)
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_token",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+func (s *Server) checkAuthHandler(w http.ResponseWriter, r *http.Request) {
+	sessionToken := s.getSessionToken(r)
+	authenticated := s.isValidSession(sessionToken)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"authenticated": authenticated,
+	})
+}
+
 func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		s.downloadHandler(w, r)
@@ -135,15 +355,17 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := r.ParseMultipartForm(100 << 20) // 100 MB max
-	if err != nil {
-		http.Error(w, "Failed to parse form", http.StatusBadRequest)
-		return
-	}
+	// Set max memory for parsing form
+	r.ParseMultipartForm(maxFormSize)
 
 	files := r.MultipartForm.File["files"]
 	if len(files) == 0 {
-		http.Error(w, "No files uploaded", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "No files uploaded",
+		})
 		return
 	}
 
@@ -154,12 +376,31 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		URL       string `json:"url"`
 	}
 
+	type UploadError struct {
+		Filename string `json:"filename"`
+		Error    string `json:"error"`
+	}
+
 	var uploadedFiles []UploadedFile
+	var uploadErrors []UploadError
 
 	for _, fileHeader := range files {
+		// Check file size before processing
+		if fileHeader.Size > maxFileSize {
+			uploadErrors = append(uploadErrors, UploadError{
+				Filename: fileHeader.Filename,
+				Error:    fmt.Sprintf("File size (%d MB) exceeds maximum allowed size of %d MB", fileHeader.Size/(1<<20), maxFileSize/(1<<20)),
+			})
+			continue
+		}
+
 		file, err := fileHeader.Open()
 		if err != nil {
 			log.Printf("Error opening file: %v", err)
+			uploadErrors = append(uploadErrors, UploadError{
+				Filename: fileHeader.Filename,
+				Error:    "Failed to open file",
+			})
 			continue
 		}
 
@@ -171,16 +412,36 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			file.Close()
 			log.Printf("Error creating file: %v", err)
+			uploadErrors = append(uploadErrors, UploadError{
+				Filename: fileHeader.Filename,
+				Error:    "Failed to create file",
+			})
 			continue
 		}
 
-		_, err = io.Copy(dst, file)
+		// Use LimitedReader to enforce size limit during copy
+		limitedReader := io.LimitReader(file, maxFileSize+1)
+		n, err := io.Copy(dst, limitedReader)
 		file.Close()
 		dst.Close()
 
 		if err != nil {
 			os.Remove(filePath)
 			log.Printf("Error saving file: %v", err)
+			uploadErrors = append(uploadErrors, UploadError{
+				Filename: fileHeader.Filename,
+				Error:    "Failed to save file",
+			})
+			continue
+		}
+
+		// Check if file exceeded limit during copy
+		if n > maxFileSize {
+			os.Remove(filePath)
+			uploadErrors = append(uploadErrors, UploadError{
+				Filename: fileHeader.Filename,
+				Error:    fmt.Sprintf("File size exceeds maximum allowed size of %d MB", maxFileSize/(1<<20)),
+			})
 			continue
 		}
 
@@ -208,15 +469,17 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"success": true, "files": [`)
-	for i, f := range uploadedFiles {
-		if i > 0 {
-			fmt.Fprint(w, ",")
-		}
-		fmt.Fprintf(w, `{"hash": "%s", "filename": "%s", "extension": "%s", "url": "%s"}`,
-			f.Hash, f.Filename, f.Extension, f.URL)
+
+	response := map[string]interface{}{
+		"success": true,
+		"files":   uploadedFiles,
 	}
-	fmt.Fprint(w, `]}`)
+
+	if len(uploadErrors) > 0 {
+		response["errors"] = uploadErrors
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
 
 func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
@@ -368,15 +631,29 @@ func (s *Server) cleanupRoutine() {
 }
 
 func main() {
+	// Load credentials from config file
+	configPath := "config"
+
+	username, password, err := loadCredentials(configPath)
+	if err != nil {
+		log.Fatal("Failed to load credentials:", err)
+	}
+
 	uploadDir := "./uploads"
+	if uploadEnv := os.Getenv("UPLOAD_DIR"); uploadEnv != "" {
+		uploadDir = uploadEnv
+	}
 	if err := os.MkdirAll(uploadDir, 0755); err != nil {
 		log.Fatal("Failed to create upload directory:", err)
 	}
 
 	baseURL := "http://localhost:8080"
+	if baseEnv := os.Getenv("BASE_URL"); baseEnv != "" {
+		baseURL = baseEnv
+	}
 	ttl := 3 * time.Hour
 
-	server, err := NewServer(uploadDir, baseURL, ttl)
+	server, err := NewServer(uploadDir, baseURL, ttl, username, password)
 	if err != nil {
 		log.Fatal("Failed to create server:", err)
 	}
@@ -385,7 +662,10 @@ func main() {
 	go server.cleanupRoutine()
 
 	http.HandleFunc("/", server.indexHandler)
-	http.HandleFunc("/upload", server.uploadHandler)
+	http.HandleFunc("/upload", server.requireAuth(server.uploadHandler))
+	http.HandleFunc("/login", server.loginHandler)
+	http.HandleFunc("/logout", server.logoutHandler)
+	http.HandleFunc("/check-auth", server.checkAuthHandler)
 
 	port := ":8080"
 	log.Printf("Server starting on %s", port)

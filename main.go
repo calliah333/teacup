@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,8 +17,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 const (
@@ -27,10 +24,17 @@ const (
 	maxFormSize = 500 << 20 // 500 MB total form size (allows multiple files)
 )
 
+type FileRecord struct {
+	Hash       string    `json:"hash"`
+	Filename   string    `json:"filename"`
+	UploadTime time.Time `json:"upload_time"`
+	FilePath   string    `json:"file_path"`
+}
+
 type Server struct {
-	db         *sql.DB
+	filesJSON  string
+	filesMu    sync.RWMutex
 	uploadDir  string
-	baseURL    string
 	ttl        time.Duration
 	indexTmpl  *template.Template
 	sessions   map[string]time.Time
@@ -105,23 +109,17 @@ func loadCredentials(configPath string) (string, string, string, error) {
 	return username, password, port, nil
 }
 
-func NewServer(uploadDir, baseURL string, ttl time.Duration, username, password string) (*Server, error) {
+func NewServer(uploadDir string, ttl time.Duration, username, password string) (*Server, error) {
 	tmpl, err := template.ParseFiles("index.html")
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse index.html: %w", err)
 	}
 
-	// Initialize database
-	dbPath := filepath.Join(uploadDir, "files.db")
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
-	}
+	filesJSON := filepath.Join(uploadDir, "files.json")
 
 	server := &Server{
-		db:        db,
+		filesJSON: filesJSON,
 		uploadDir: uploadDir,
-		baseURL:   baseURL,
 		ttl:       ttl,
 		indexTmpl: tmpl,
 		sessions:  make(map[string]time.Time),
@@ -129,13 +127,12 @@ func NewServer(uploadDir, baseURL string, ttl time.Duration, username, password 
 		password:  strings.TrimSpace(password),
 	}
 
-	// Initialize database schema
-	if err := server.initDB(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	// Initialize JSON file if it doesn't exist
+	if err := server.initFiles(); err != nil {
+		return nil, fmt.Errorf("failed to initialize files storage: %w", err)
 	}
 
-	// Load existing files from database and start cleanup goroutines
+	// Load existing files from JSON and start cleanup goroutines
 	if err := server.loadExistingFiles(); err != nil {
 		log.Printf("Warning: failed to load existing files: %v", err)
 	}
@@ -146,57 +143,98 @@ func NewServer(uploadDir, baseURL string, ttl time.Duration, username, password 
 	return server, nil
 }
 
-func (s *Server) initDB() error {
-	query := `
-	CREATE TABLE IF NOT EXISTS files (
-		hash TEXT PRIMARY KEY,
-		filename TEXT NOT NULL,
-		upload_time INTEGER NOT NULL,
-		file_path TEXT NOT NULL
-	)`
-	_, err := s.db.Exec(query)
-	return err
+func (s *Server) initFiles() error {
+	s.filesMu.Lock()
+	defer s.filesMu.Unlock()
+
+	// If file doesn't exist, create it with empty array
+	if _, err := os.Stat(s.filesJSON); os.IsNotExist(err) {
+		return s.saveFilesLocked([]FileRecord{})
+	}
+	return nil
 }
 
-func (s *Server) loadExistingFiles() error {
-	query := `SELECT hash, filename, upload_time, file_path FROM files`
-	rows, err := s.db.Query(query)
+func (s *Server) loadFiles() ([]FileRecord, error) {
+	s.filesMu.RLock()
+	defer s.filesMu.RUnlock()
+
+	return s.loadFilesLocked()
+}
+
+func (s *Server) loadFilesLocked() ([]FileRecord, error) {
+	// If file doesn't exist, return empty array
+	if _, err := os.Stat(s.filesJSON); os.IsNotExist(err) {
+		return []FileRecord{}, nil
+	}
+
+	data, err := os.ReadFile(s.filesJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	var files []FileRecord
+	if len(data) == 0 {
+		return []FileRecord{}, nil
+	}
+
+	if err := json.Unmarshal(data, &files); err != nil {
+		return nil, err
+	}
+
+	return files, nil
+}
+
+func (s *Server) saveFiles(files []FileRecord) error {
+	s.filesMu.Lock()
+	defer s.filesMu.Unlock()
+	return s.saveFilesLocked(files)
+}
+
+func (s *Server) saveFilesLocked(files []FileRecord) error {
+	data, err := json.MarshalIndent(files, "", "  ")
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+
+	return os.WriteFile(s.filesJSON, data, 0644)
+}
+
+func (s *Server) loadExistingFiles() error {
+	files, err := s.loadFiles()
+	if err != nil {
+		return err
+	}
 
 	now := time.Now()
-	for rows.Next() {
-		var hash, filename, filePath string
-		var uploadTimeUnix int64
+	var validFiles []FileRecord
 
-		if err := rows.Scan(&hash, &filename, &uploadTimeUnix, &filePath); err != nil {
-			log.Printf("Error scanning row: %v", err)
-			continue
-		}
-
-		uploadTime := time.Unix(uploadTimeUnix, 0)
-		expiresAt := uploadTime.Add(s.ttl)
+	for _, file := range files {
+		expiresAt := file.UploadTime.Add(s.ttl)
 
 		// Check if file still exists on disk
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			// File doesn't exist, remove from database
-			s.db.Exec("DELETE FROM files WHERE hash = ?", hash)
+		if _, err := os.Stat(file.FilePath); os.IsNotExist(err) {
+			// File doesn't exist, skip it (will be removed)
 			continue
 		}
+
+		validFiles = append(validFiles, file)
 
 		// If file hasn't expired yet, schedule deletion
 		if expiresAt.After(now) {
 			remainingTTL := expiresAt.Sub(now)
-			go s.scheduleDelete(hash, remainingTTL)
+			go s.scheduleDelete(file.Hash, remainingTTL)
 		} else {
 			// File has expired, delete it immediately
-			go s.deleteFile(hash)
+			go s.deleteFile(file.Hash)
 		}
 	}
 
-	return rows.Err()
+	// Save back the valid files (removing ones that don't exist on disk)
+	if len(validFiles) != len(files) {
+		return s.saveFiles(validFiles)
+	}
+
+	return nil
 }
 
 func (s *Server) generateHash(filename string) string {
@@ -385,7 +423,6 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		Hash      string `json:"hash"`
 		Filename  string `json:"filename"`
 		Extension string `json:"extension"`
-		URL       string `json:"url"`
 	}
 
 	type UploadError struct {
@@ -459,14 +496,25 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 		uploadTime := time.Now()
 
-		// Store file info in database
-		_, err = s.db.Exec(
-			"INSERT INTO files (hash, filename, upload_time, file_path) VALUES (?, ?, ?, ?)",
-			hash, fileHeader.Filename, uploadTime.Unix(), filePath,
-		)
+		// Store file info in JSON
+		fileRecord := FileRecord{
+			Hash:       hash,
+			Filename:   fileHeader.Filename,
+			UploadTime: uploadTime,
+			FilePath:   filePath,
+		}
+
+		files, err := s.loadFiles()
 		if err != nil {
 			os.Remove(filePath)
-			log.Printf("Error storing file info in database: %v", err)
+			log.Printf("Error loading files: %v", err)
+			continue
+		}
+
+		files = append(files, fileRecord)
+		if err := s.saveFiles(files); err != nil {
+			os.Remove(filePath)
+			log.Printf("Error storing file info: %v", err)
 			continue
 		}
 
@@ -474,7 +522,6 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 			Hash:      hash,
 			Filename:  fileHeader.Filename,
 			Extension: ext,
-			URL:       fmt.Sprintf("%s/%s%s", s.baseURL, hash, ext),
 		})
 
 		go s.scheduleDelete(hash, s.ttl)
@@ -517,19 +564,26 @@ func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var filename, filePath string
-	err := s.db.QueryRow(
-		"SELECT filename, file_path FROM files WHERE hash = ?",
-		hash,
-	).Scan(&filename, &filePath)
-
-	if err == sql.ErrNoRows {
-		http.NotFound(w, r)
+	files, err := s.loadFiles()
+	if err != nil {
+		log.Printf("Error loading files: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	if err != nil {
-		log.Printf("Error querying database: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+
+	var filename, filePath string
+	var found bool
+	for _, file := range files {
+		if file.Hash == hash {
+			filename = file.Filename
+			filePath = file.FilePath
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		http.NotFound(w, r)
 		return
 	}
 
@@ -543,8 +597,8 @@ func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Check if file still exists on disk
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		// File doesn't exist, remove from database
-		s.db.Exec("DELETE FROM files WHERE hash = ?", hash)
+		// File doesn't exist, remove from JSON
+		s.removeFile(hash)
 		http.NotFound(w, r)
 		return
 	}
@@ -574,19 +628,54 @@ func (s *Server) scheduleDelete(hash string, ttl time.Duration) {
 	s.deleteFile(hash)
 }
 
-func (s *Server) deleteFile(hash string) {
-	var filename, filePath string
-	err := s.db.QueryRow(
-		"SELECT filename, file_path FROM files WHERE hash = ?",
-		hash,
-	).Scan(&filename, &filePath)
-
-	if err == sql.ErrNoRows {
-		return // Already deleted
-	}
+func (s *Server) removeFile(hash string) {
+	files, err := s.loadFiles()
 	if err != nil {
-		log.Printf("Error querying file for deletion: %v", err)
+		log.Printf("Error loading files for removal: %v", err)
 		return
+	}
+
+	var updatedFiles []FileRecord
+	var filename string
+	for _, file := range files {
+		if file.Hash == hash {
+			filename = file.Filename
+			// Skip this file (remove it)
+		} else {
+			updatedFiles = append(updatedFiles, file)
+		}
+	}
+
+	// If we didn't find the file, it's already removed
+	if filename == "" {
+		return
+	}
+
+	if err := s.saveFiles(updatedFiles); err != nil {
+		log.Printf("Error saving files after removal: %v", err)
+	}
+}
+
+func (s *Server) deleteFile(hash string) {
+	files, err := s.loadFiles()
+	if err != nil {
+		log.Printf("Error loading files for deletion: %v", err)
+		return
+	}
+
+	var filename, filePath string
+	var found bool
+	for _, file := range files {
+		if file.Hash == hash {
+			filename = file.Filename
+			filePath = file.FilePath
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return // Already deleted
 	}
 
 	// Delete file from disk
@@ -594,13 +683,9 @@ func (s *Server) deleteFile(hash string) {
 		log.Printf("Error deleting file %s: %v", filePath, err)
 	}
 
-	// Delete from database
-	_, err = s.db.Exec("DELETE FROM files WHERE hash = ?", hash)
-	if err != nil {
-		log.Printf("Error deleting file record from database: %v", err)
-	} else {
-		log.Printf("Deleted expired file: %s (%s)", filename, hash)
-	}
+	// Delete from JSON
+	s.removeFile(hash)
+	log.Printf("Deleted expired file: %s (%s)", filename, hash)
 }
 
 func (s *Server) cleanupRoutine() {
@@ -608,37 +693,27 @@ func (s *Server) cleanupRoutine() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		now := time.Now().Unix()
-		ttlSeconds := int64(s.ttl.Seconds())
-
-		// Find expired files
-		query := `SELECT hash, filename, file_path FROM files WHERE ? - upload_time > ?`
-		rows, err := s.db.Query(query, now, ttlSeconds)
+		now := time.Now()
+		files, err := s.loadFiles()
 		if err != nil {
-			log.Printf("Error querying expired files: %v", err)
+			log.Printf("Error loading files for cleanup: %v", err)
 			continue
 		}
 
-		for rows.Next() {
-			var hash, filename, filePath string
-			if err := rows.Scan(&hash, &filename, &filePath); err != nil {
-				log.Printf("Error scanning expired file: %v", err)
-				continue
-			}
+		for _, file := range files {
+			expiresAt := file.UploadTime.Add(s.ttl)
+			if expiresAt.Before(now) {
+				// File has expired, delete it
+				// Delete file from disk
+				if err := os.Remove(file.FilePath); err != nil && !os.IsNotExist(err) {
+					log.Printf("Error deleting expired file %s: %v", file.FilePath, err)
+				}
 
-			// Delete file from disk
-			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-				log.Printf("Error deleting expired file %s: %v", filePath, err)
-			}
-
-			// Delete from database
-			if _, err := s.db.Exec("DELETE FROM files WHERE hash = ?", hash); err != nil {
-				log.Printf("Error deleting expired file record: %v", err)
-			} else {
-				log.Printf("Cleaned up expired file: %s (%s)", filename, hash)
+				// Delete from JSON
+				s.removeFile(file.Hash)
+				log.Printf("Cleaned up expired file: %s (%s)", file.Filename, file.Hash)
 			}
 		}
-		rows.Close()
 	}
 }
 
@@ -650,6 +725,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to load credentials:", err)
 	}
+	log.Printf("Loaded credentials: username=%s, password=%s, port=%s", username, password, port)
 
 	uploadDir := "./uploads"
 	if uploadEnv := os.Getenv("UPLOAD_DIR"); uploadEnv != "" {
@@ -661,14 +737,10 @@ func main() {
 
 	ttl := 3 * time.Hour
 
-	// Construct baseURL using the port from config
-	baseURL := fmt.Sprintf("http://localhost%s", port)
-
-	server, err := NewServer(uploadDir, baseURL, ttl, username, password)
+	server, err := NewServer(uploadDir, ttl, username, password)
 	if err != nil {
 		log.Fatal("Failed to create server:", err)
 	}
-	defer server.db.Close()
 
 	go server.cleanupRoutine()
 

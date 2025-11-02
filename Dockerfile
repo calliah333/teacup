@@ -1,7 +1,7 @@
 FROM golang:alpine
 
-# Install sqlite and ca-certificates for HTTPS support
-RUN apk --no-cache add ca-certificates sqlite
+# Install ca-certificates for HTTPS support
+RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 

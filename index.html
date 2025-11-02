@@ -295,54 +295,11 @@
             fileInput.click();
         });
 
-        // Clear errors when files are selected
+        // Auto-upload when files are selected
         fileInput.addEventListener('change', () => {
             fileSizeError.classList.add('hidden');
-        });
-
-        // Clipboard paste handler
-        document.addEventListener('paste', async (e) => {
-            // Only handle paste if user is authenticated and upload card is visible
-            if (!isAuthenticated || uploadCard.classList.contains('hidden')) {
-                return;
-            }
-
-            const items = e.clipboardData?.items;
-            if (!items) return;
-
-            const files = [];
-            for (let i = 0; i < items.length; i++) {
-                const item = items[i];
-                // Check if the item is a file
-                if (item.kind === 'file') {
-                    const file = item.getAsFile();
-                    if (file) {
-                        files.push(file);
-                    }
-                }
-            }
-
-            if (files.length > 0) {
-                e.preventDefault();
-                
-                // Combine with existing files if any
-                const dt = new DataTransfer();
-                
-                // Add existing files
-                if (fileInput.files.length > 0) {
-                    for (let file of fileInput.files) {
-                        dt.items.add(file);
-                    }
-                }
-                
-                // Add pasted files
-                for (let file of files) {
-                    dt.items.add(file);
-                }
-                
-                fileInput.files = dt.files;
-                
-                // Automatically trigger upload
+            // Automatically trigger upload when files are selected
+            if (fileInput.files.length > 0) {
                 uploadForm.dispatchEvent(new Event('submit', { cancelable: true }));
             }
         });
@@ -355,6 +312,58 @@
         });
         dropZone.addEventListener('blur', () => {
             dropZone.classList.remove('ring-2', 'ring-ring', 'ring-offset-2');
+        });
+
+        // Also listen for paste on the window to catch all paste events
+        window.addEventListener('paste', async (e) => {
+            // Only handle paste if user is authenticated and upload card is visible
+            if (!isAuthenticated || uploadCard.classList.contains('hidden')) {
+                return;
+            }
+
+            // Check if clipboardData is available
+            if (!e.clipboardData) {
+                return;
+            }
+
+            const items = e.clipboardData.items;
+            if (!items || items.length === 0) {
+                return;
+            }
+
+            const files = [];
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+                // Check if the item is a file
+                if (item.kind === 'file') {
+                    try {
+                        const file = item.getAsFile();
+                        if (file && file.size > 0) {
+                            files.push(file);
+                        }
+                    } catch (err) {
+                        console.error('Error getting file from clipboard:', err);
+                    }
+                }
+            }
+
+            if (files.length > 0) {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                // Create new DataTransfer with pasted files
+                const dt = new DataTransfer();
+                
+                // Add pasted files
+                for (let file of files) {
+                    dt.items.add(file);
+                }
+                
+                fileInput.files = dt.files;
+                
+                // Automatically trigger upload
+                uploadForm.dispatchEvent(new Event('submit', { cancelable: true }));
+            }
         });
 
         // Drag and drop handlers
@@ -422,7 +431,47 @@
             uploadText.textContent = 'Uploading...';
             uploadIcon.classList.add('hidden');
             spinner.classList.remove('hidden');
-            results.innerHTML = '';
+            
+            // Create progress bars for each file
+            const filesArray = Array.from(fileInput.files);
+            const timestamp = Date.now();
+            const fileIds = [];
+            
+            let progressHtml = `
+                <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6 mb-4">
+                    <h3 class="text-lg font-semibold mb-4 flex items-center">
+                        <svg class="w-5 h-5 mr-2 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                        </svg>
+                        Uploading...
+                    </h3>
+                    <div class="space-y-3">
+            `;
+            
+            filesArray.forEach((file, index) => {
+                const fileId = `file-${index}-${timestamp}`;
+                fileIds.push(fileId);
+                progressHtml += `
+                    <div class="bg-accent rounded-md p-4 border border-border" data-file-index="${index}">
+                        <div class="flex items-start justify-between mb-2">
+                            <div class="flex-1 min-w-0">
+                                <p class="text-sm font-medium text-foreground truncate">${escapeHtml(file.name)}</p>
+                                <p class="text-xs text-muted-foreground mt-1" id="${fileId}-status">Preparing...</p>
+                            </div>
+                        </div>
+                        <div class="w-full bg-background rounded-full h-2 overflow-hidden">
+                            <div class="bg-primary h-2 rounded-full transition-all duration-300 ease-out" id="${fileId}-progress" style="width: 0%"></div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            progressHtml += `
+                    </div>
+                </div>
+            `;
+            
+            results.innerHTML = progressHtml;
             
             const formData = new FormData();
             for (let file of fileInput.files) {
@@ -430,109 +479,205 @@
             }
             
             try {
-                const response = await fetch('/upload', {
-                    method: 'POST',
-                    body: formData
+                // Use XMLHttpRequest for progress tracking
+                const xhr = new XMLHttpRequest();
+                
+                // Track overall upload progress
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        const percentComplete = Math.round((e.loaded / e.total) * 100);
+                        
+                        // Update all progress bars
+                        fileIds.forEach((fileId) => {
+                            const progress = document.getElementById(`${fileId}-progress`);
+                            const status = document.getElementById(`${fileId}-status`);
+                            if (progress) {
+                                progress.style.width = `${percentComplete}%`;
+                            }
+                            if (status) {
+                                status.textContent = `Uploading... ${percentComplete}%`;
+                            }
+                        });
+                    }
                 });
                 
-                const data = await response.json();
-                
-                // Handle authentication errors
-                if (response.status === 401) {
-                    isAuthenticated = false;
-                    updateUI();
-                    results.innerHTML = `
-                        <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
-                            <p class="font-medium">Session expired</p>
-                            <p class="text-sm mt-1">Please login again to upload files.</p>
-                        </div>
-                    `;
-                    return;
-                }
-                
-                if (data.success) {
-                    let html = '';
-                    
-                    // Show uploaded files
-                    if (data.files && data.files.length > 0) {
-                        html += `
-                            <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6 mb-4">
-                                <h3 class="text-lg font-semibold mb-4 flex items-center">
-                                    <svg class="w-5 h-5 mr-2 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    Upload Successful!
-                                </h3>
-                                <div class="space-y-3">
+                // Handle completion
+                xhr.addEventListener('load', () => {
+                    // Handle authentication errors
+                    if (xhr.status === 401) {
+                        isAuthenticated = false;
+                        updateUI();
+                        results.innerHTML = `
+                            <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
+                                <p class="font-medium">Session expired</p>
+                                <p class="text-sm mt-1">Please login again to upload files.</p>
+                            </div>
                         `;
+                        uploadBtn.disabled = false;
+                        uploadText.textContent = 'Upload Files';
+                        uploadIcon.classList.remove('hidden');
+                        spinner.classList.add('hidden');
+                        fileInput.value = '';
+                        return;
+                    }
+                    
+                    // Handle other HTTP errors
+                    if (xhr.status < 200 || xhr.status >= 300) {
+                        results.innerHTML = `
+                            <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
+                                <p class="font-medium">Upload failed</p>
+                                <p class="text-sm mt-1">Server error (${xhr.status})</p>
+                            </div>
+                        `;
+                        uploadBtn.disabled = false;
+                        uploadText.textContent = 'Upload Files';
+                        uploadIcon.classList.remove('hidden');
+                        spinner.classList.add('hidden');
+                        fileInput.value = '';
+                        return;
+                    }
+                    
+                    let data;
+                    try {
+                        data = JSON.parse(xhr.responseText);
+                    } catch (err) {
+                        results.innerHTML = `
+                            <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
+                                <p class="font-medium">Upload failed</p>
+                                <p class="text-sm mt-1">Failed to parse server response</p>
+                            </div>
+                        `;
+                        uploadBtn.disabled = false;
+                        uploadText.textContent = 'Upload Files';
+                        uploadIcon.classList.remove('hidden');
+                        spinner.classList.add('hidden');
+                        fileInput.value = '';
+                        return;
+                    }
+                    
+                    if (data.success) {
+                        let html = '';
                         
-                        data.files.forEach(file => {
-                            const url = file.url || (window.location.origin + '/' + file.hash + (file.extension || ''));
+                        // Show uploaded files
+                        if (data.files && data.files.length > 0) {
                             html += `
-                                <div class="bg-accent rounded-md p-4 border border-border">
-                                    <div class="flex items-start justify-between">
-                                        <div class="flex-1 min-w-0">
-                                            <p class="text-sm font-medium text-foreground mb-1 truncate">${escapeHtml(file.filename)}</p>
-                                            <div class="flex items-center space-x-2">
-                                                <a 
-                                                    href="${url}" 
-                                                    target="_blank" 
-                                                    rel="noopener noreferrer"
-                                                    class="text-sm text-primary hover:underline font-mono break-all"
-                                                >
-                                                    ${url}
-                                                </a>
-                                                <button 
-                                                    onclick="navigator.clipboard.writeText('${url}')"
-                                                    class="ml-2 p-1 hover:bg-background rounded transition-colors"
-                                                    title="Copy link"
-                                                >
-                                                    <svg class="w-4 h-4 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
-                                                    </svg>
-                                                </button>
+                                <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6 mb-4">
+                                    <h3 class="text-lg font-semibold mb-4 flex items-center">
+                                        <svg class="w-5 h-5 mr-2 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                        </svg>
+                                        Upload Successful!
+                                    </h3>
+                                    <div class="space-y-3">
+                            `;
+                            
+                            data.files.forEach(file => {
+                                const url = window.location.origin + '/' + file.hash + (file.extension || '');
+                                html += `
+                                    <div class="bg-accent rounded-md p-4 border border-border">
+                                        <div class="flex items-start justify-between">
+                                            <div class="flex-1 min-w-0">
+                                                <p class="text-sm font-medium text-foreground mb-1 truncate">${escapeHtml(file.filename)}</p>
+                                                <div class="flex items-center space-x-2">
+                                                    <a 
+                                                        href="${url}" 
+                                                        target="_blank" 
+                                                        rel="noopener noreferrer"
+                                                        class="text-sm text-primary hover:underline font-mono break-all"
+                                                    >
+                                                        ${url}
+                                                    </a>
+                                                    <button 
+                                                        onclick="navigator.clipboard.writeText('${url}')"
+                                                        class="ml-2 p-1 hover:bg-background rounded transition-colors"
+                                                        title="Copy link"
+                                                    >
+                                                        <svg class="w-4 h-4 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                                                        </svg>
+                                                    </button>
+                                                </div>
                                             </div>
                                         </div>
                                     </div>
+                                `;
+                            });
+                            
+                            html += `
+                                    </div>
                                 </div>
                             `;
-                        });
+                        }
                         
-                        html += `
+                        // Show errors if any
+                        if (data.errors && data.errors.length > 0) {
+                            html += `
+                                <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
+                                    <p class="font-medium mb-2">Upload errors:</p>
+                                    <ul class="list-disc list-inside space-y-1 text-sm">
+                                        ${data.errors.map(err => `<li><strong>${escapeHtml(err.filename)}</strong>: ${escapeHtml(err.error)}</li>`).join('')}
+                                    </ul>
                                 </div>
-                            </div>
-                        `;
-                    }
-                    
-                    // Show errors if any
-                    if (data.errors && data.errors.length > 0) {
-                        html += `
+                            `;
+                        }
+                        
+                        if (!html && (!data.files || data.files.length === 0)) {
+                            html = `
+                                <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6">
+                                    <p class="text-muted-foreground">No files were uploaded.</p>
+                                </div>
+                            `;
+                        }
+                        
+                        results.innerHTML = html;
+                    } else {
+                        results.innerHTML = `
                             <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
-                                <p class="font-medium mb-2">Upload errors:</p>
-                                <ul class="list-disc list-inside space-y-1 text-sm">
-                                    ${data.errors.map(err => `<li><strong>${escapeHtml(err.filename)}</strong>: ${escapeHtml(err.error)}</li>`).join('')}
-                                </ul>
+                                <p class="font-medium">Upload failed</p>
+                                <p class="text-sm mt-1">${escapeHtml(data.error || 'Unknown error occurred')}</p>
                             </div>
                         `;
                     }
                     
-                    if (!html && (!data.files || data.files.length === 0)) {
-                        html = `
-                            <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6">
-                                <p class="text-muted-foreground">No files were uploaded.</p>
-                            </div>
-                        `;
-                    }
-                    
-                    results.innerHTML = html;
-                } else {
+                    uploadBtn.disabled = false;
+                    uploadText.textContent = 'Upload Files';
+                    uploadIcon.classList.remove('hidden');
+                    spinner.classList.add('hidden');
+                    fileInput.value = '';
+                });
+                
+                // Handle errors
+                xhr.addEventListener('error', () => {
                     results.innerHTML = `
                         <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
                             <p class="font-medium">Upload failed</p>
-                            <p class="text-sm mt-1">${escapeHtml(data.error || 'Unknown error occurred')}</p>
+                            <p class="text-sm mt-1">Network error occurred</p>
                         </div>
                     `;
-                }
+                    uploadBtn.disabled = false;
+                    uploadText.textContent = 'Upload Files';
+                    uploadIcon.classList.remove('hidden');
+                    spinner.classList.add('hidden');
+                    fileInput.value = '';
+                });
+                
+                // Handle abort
+                xhr.addEventListener('abort', () => {
+                    results.innerHTML = `
+                        <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
+                            <p class="font-medium">Upload cancelled</p>
+                        </div>
+                    `;
+                    uploadBtn.disabled = false;
+                    uploadText.textContent = 'Upload Files';
+                    uploadIcon.classList.remove('hidden');
+                    spinner.classList.add('hidden');
+                    fileInput.value = '';
+                });
+                
+                // Start the upload
+                xhr.open('POST', '/upload');
+                xhr.send(formData);
             } catch (err) {
                 results.innerHTML = `
                     <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
@@ -540,7 +685,6 @@
                         <p class="text-sm mt-1">${escapeHtml(err.message)}</p>
                     </div>
                 `;
-            } finally {
                 uploadBtn.disabled = false;
                 uploadText.textContent = 'Upload Files';
                 uploadIcon.classList.remove('hidden');

@@ -152,6 +152,28 @@
                 </div>
                 <div id="fileSizeError" class="hidden bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4 text-sm mb-4"></div>
 
+                <!-- Expiration Options -->
+                <div class="bg-secondary/30 border border-border rounded-lg p-4 mb-4 space-y-3">
+                    <div class="flex items-center space-x-2">
+                        <input id="permanent" type="checkbox" class="h-4 w-4">
+                        <label for="permanent" class="text-sm">Permanent (no automatic deletion)</label>
+                    </div>
+                    <div id="ttlControls" class="grid grid-cols-2 gap-2">
+                        <div>
+                            <label for="ttlValue" class="block text-xs text-muted-foreground mb-1">Time value</label>
+                            <input id="ttlValue" type="number" min="1" value="3" class="w-full px-3 py-2 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2" />
+                        </div>
+                        <div>
+                            <label for="ttlUnit" class="block text-xs text-muted-foreground mb-1">Time unit</label>
+                            <select id="ttlUnit" class="w-full px-3 py-2 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2">
+                                <option value="minutes">Minutes</option>
+                                <option value="hours" selected>Hours</option>
+                                <option value="days">Days</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Upload Button -->
                 <button 
                     type="submit" 
@@ -180,8 +202,8 @@
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                 </svg>
                 <div>
-                    <p class="text-sm font-medium">Automatic Cleanup</p>
-                    <p class="text-sm text-blue-700 mt-1">All uploaded files will be automatically deleted after 3 hours.</p>
+                    <p class="text-sm font-medium">Expiration</p>
+                    <p class="text-sm text-blue-700 mt-1">Files expire by default after 3 hours. You can customize the time or mark uploads as permanent.</p>
                 </div>
             </div>
         </div>
@@ -205,6 +227,10 @@
         const loginError = document.getElementById('loginError');
         const logoutBtn = document.getElementById('logoutBtn');
         const fileSizeError = document.getElementById('fileSizeError');
+        const permanentInput = document.getElementById('permanent');
+        const ttlControls = document.getElementById('ttlControls');
+        const ttlValueInput = document.getElementById('ttlValue');
+        const ttlUnitSelect = document.getElementById('ttlUnit');
 
         const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB in bytes
 
@@ -236,6 +262,17 @@
                 results.innerHTML = '';
             }
         }
+
+        // Toggle TTL controls when permanent is checked
+        permanentInput.addEventListener('change', () => {
+            if (permanentInput.checked) {
+                ttlControls.classList.add('opacity-50');
+                ttlControls.classList.add('pointer-events-none');
+            } else {
+                ttlControls.classList.remove('opacity-50');
+                ttlControls.classList.remove('pointer-events-none');
+            }
+        });
 
         // Login form handler
         loginForm.addEventListener('submit', async (e) => {
@@ -476,6 +513,19 @@
             const formData = new FormData();
             for (let file of fileInput.files) {
                 formData.append('files', file);
+            }
+            // Add TTL/permanence controls
+            if (permanentInput.checked) {
+                formData.append('permanent', 'true');
+            } else {
+                const val = parseInt(ttlValueInput.value, 10);
+                const unit = ttlUnitSelect.value;
+                const seconds = isNaN(val) || val <= 0 ? 0 : (
+                    unit === 'minutes' ? val * 60 : unit === 'hours' ? val * 3600 : val * 86400
+                );
+                if (seconds > 0) {
+                    formData.append('ttl_seconds', String(seconds));
+                }
             }
             
             try {

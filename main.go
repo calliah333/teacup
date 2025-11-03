@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,8 @@ type FileRecord struct {
 	Filename   string    `json:"filename"`
 	UploadTime time.Time `json:"upload_time"`
 	FilePath   string    `json:"file_path"`
+	TTLSeconds int64     `json:"ttl_seconds,omitempty"`
+	Permanent  bool      `json:"permanent,omitempty"`
 }
 
 type Server struct {
@@ -209,7 +212,15 @@ func (s *Server) loadExistingFiles() error {
 	var validFiles []FileRecord
 
 	for _, file := range files {
-		expiresAt := file.UploadTime.Add(s.ttl)
+		var expiresAt time.Time
+		if file.Permanent {
+			// No expiry
+		} else if file.TTLSeconds > 0 {
+			expiresAt = file.UploadTime.Add(time.Duration(file.TTLSeconds) * time.Second)
+		} else {
+			// Backward compatibility: use server default TTL if not set
+			expiresAt = file.UploadTime.Add(s.ttl)
+		}
 
 		// Check if file still exists on disk
 		if _, err := os.Stat(file.FilePath); os.IsNotExist(err) {
@@ -220,10 +231,10 @@ func (s *Server) loadExistingFiles() error {
 		validFiles = append(validFiles, file)
 
 		// If file hasn't expired yet, schedule deletion
-		if expiresAt.After(now) {
+		if !file.Permanent && !expiresAt.IsZero() && expiresAt.After(now) {
 			remainingTTL := expiresAt.Sub(now)
 			go s.scheduleDelete(file.Hash, remainingTTL)
-		} else {
+		} else if !file.Permanent && !expiresAt.IsZero() {
 			// File has expired, delete it immediately
 			go s.deleteFile(file.Hash)
 		}
@@ -433,6 +444,28 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	var uploadedFiles []UploadedFile
 	var uploadErrors []UploadError
 
+	// Parse optional TTL and permanence from form
+	permanent := false
+	if pv := r.FormValue("permanent"); pv != "" {
+		// Accept "true"/"1"/"on"
+		switch strings.ToLower(pv) {
+		case "true", "1", "on", "yes":
+			permanent = true
+		}
+	}
+	var perFileTTL time.Duration
+	if !permanent {
+		if ttlStr := r.FormValue("ttl_seconds"); ttlStr != "" {
+			if secs, err := strconv.ParseInt(ttlStr, 10, 64); err == nil && secs > 0 {
+				perFileTTL = time.Duration(secs) * time.Second
+			}
+		}
+		// If not provided or invalid, fallback to server default
+		if perFileTTL <= 0 {
+			perFileTTL = s.ttl
+		}
+	}
+
 	for _, fileHeader := range files {
 		// Check file size before processing
 		if fileHeader.Size > maxFileSize {
@@ -502,6 +535,13 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 			Filename:   fileHeader.Filename,
 			UploadTime: uploadTime,
 			FilePath:   filePath,
+			TTLSeconds: func() int64 {
+				if permanent {
+					return 0
+				}
+				return int64(perFileTTL.Seconds())
+			}(),
+			Permanent: permanent,
 		}
 
 		files, err := s.loadFiles()
@@ -524,7 +564,9 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 			Extension: ext,
 		})
 
-		go s.scheduleDelete(hash, s.ttl)
+		if !permanent {
+			go s.scheduleDelete(hash, perFileTTL)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -701,8 +743,16 @@ func (s *Server) cleanupRoutine() {
 		}
 
 		for _, file := range files {
-			expiresAt := file.UploadTime.Add(s.ttl)
-			if expiresAt.Before(now) {
+			if file.Permanent {
+				continue
+			}
+			var expiresAt time.Time
+			if file.TTLSeconds > 0 {
+				expiresAt = file.UploadTime.Add(time.Duration(file.TTLSeconds) * time.Second)
+			} else {
+				expiresAt = file.UploadTime.Add(s.ttl)
+			}
+			if !expiresAt.IsZero() && expiresAt.Before(now) {
 				// File has expired, delete it
 				// Delete file from disk
 				if err := os.Remove(file.FilePath); err != nil && !os.IsNotExist(err) {

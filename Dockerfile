@@ -1,8 +1,5 @@
 FROM golang:alpine
 
-# Install ca-certificates for HTTPS support
-RUN apk --no-cache add ca-certificates
-
 # Copy source code
 COPY . .
 

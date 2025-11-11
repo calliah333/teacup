@@ -192,6 +192,41 @@
             </form>
         </div>
 
+        <!-- URL Shortener Card -->
+        <div id="urlShortenerCard" class="bg-card text-card-foreground rounded-lg border border-border shadow-sm mb-6 p-6 hidden">
+            <h2 class="text-xl font-semibold mb-4">URL Shortener</h2>
+            <form id="shortenForm">
+                <div class="mb-4">
+                    <label for="urlInput" class="block text-sm font-medium mb-2">Enter URL to shorten</label>
+                    <input 
+                        type="url" 
+                        id="urlInput" 
+                        name="url"
+                        required
+                        placeholder="https://example.com"
+                        class="w-full px-3 py-2 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                    >
+                </div>
+                <div id="urlError" class="hidden bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4 text-sm mb-4"></div>
+
+                <!-- Shorten Button -->
+                <button 
+                    type="submit" 
+                    id="shortenBtn"
+                    class="w-full bg-primary text-primary-foreground hover:bg-primary/90 font-medium py-2 px-4 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center justify-center"
+                >
+                    <svg id="shortenIcon" class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path>
+                    </svg>
+                    <span id="shortenText">Shorten URL</span>
+                    <svg id="shortenSpinner" class="hidden w-4 h-4 mr-2 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                </button>
+            </form>
+        </div>
+
         <!-- Results Section -->
         <div id="results" class="space-y-4 mb-6"></div>
 
@@ -231,6 +266,14 @@
         const ttlControls = document.getElementById('ttlControls');
         const ttlValueInput = document.getElementById('ttlValue');
         const ttlUnitSelect = document.getElementById('ttlUnit');
+        const urlShortenerCard = document.getElementById('urlShortenerCard');
+        const shortenForm = document.getElementById('shortenForm');
+        const urlInput = document.getElementById('urlInput');
+        const shortenBtn = document.getElementById('shortenBtn');
+        const shortenText = document.getElementById('shortenText');
+        const shortenIcon = document.getElementById('shortenIcon');
+        const shortenSpinner = document.getElementById('shortenSpinner');
+        const urlError = document.getElementById('urlError');
 
         const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB in bytes
 
@@ -254,10 +297,12 @@
             if (isAuthenticated) {
                 loginCard.classList.add('hidden');
                 uploadCard.classList.remove('hidden');
+                urlShortenerCard.classList.remove('hidden');
                 logoutBtn.classList.remove('hidden');
             } else {
                 loginCard.classList.remove('hidden');
                 uploadCard.classList.add('hidden');
+                urlShortenerCard.classList.add('hidden');
                 logoutBtn.classList.add('hidden');
                 results.innerHTML = '';
             }
@@ -273,6 +318,7 @@
                 ttlControls.classList.remove('pointer-events-none');
             }
         });
+
 
         // Login form handler
         loginForm.addEventListener('submit', async (e) => {
@@ -621,8 +667,10 @@
                                     <div class="space-y-3">
                             `;
                             
+                            const urlsToCopy = [];
                             data.files.forEach(file => {
                                 const url = window.location.origin + '/' + file.hash + (file.extension || '');
+                                urlsToCopy.push(url);
                                 html += `
                                     <div class="bg-accent rounded-md p-4 border border-border">
                                         <div class="flex items-start justify-between">
@@ -652,6 +700,13 @@
                                     </div>
                                 `;
                             });
+                            
+                            // Auto-copy first URL to clipboard
+                            if (urlsToCopy.length > 0) {
+                                navigator.clipboard.writeText(urlsToCopy[0]).catch(err => {
+                                    console.error('Failed to copy to clipboard:', err);
+                                });
+                            }
                             
                             html += `
                                     </div>
@@ -740,6 +795,113 @@
                 uploadIcon.classList.remove('hidden');
                 spinner.classList.add('hidden');
                 fileInput.value = '';
+            }
+        });
+
+        // URL shortening form handler
+        shortenForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const url = urlInput.value.trim();
+            
+            if (!url) {
+                urlError.textContent = 'Please enter a URL';
+                urlError.classList.remove('hidden');
+                return;
+            }
+            
+            shortenBtn.disabled = true;
+            shortenText.textContent = 'Shortening...';
+            shortenIcon.classList.add('hidden');
+            shortenSpinner.classList.remove('hidden');
+            urlError.classList.add('hidden');
+            
+            try {
+                const response = await fetch('/shorten', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        url: url,
+                    }),
+                });
+                
+                // Handle authentication errors
+                if (response.status === 401) {
+                    isAuthenticated = false;
+                    updateUI();
+                    urlError.textContent = 'Session expired. Please login again.';
+                    urlError.classList.remove('hidden');
+                    shortenBtn.disabled = false;
+                    shortenText.textContent = 'Shorten URL';
+                    shortenIcon.classList.remove('hidden');
+                    shortenSpinner.classList.add('hidden');
+                    return;
+                }
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    // Display success with short URL
+                    results.innerHTML = `
+                        <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6 mb-4">
+                            <h3 class="text-lg font-semibold mb-4 flex items-center">
+                                <svg class="w-5 h-5 mr-2 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                </svg>
+                                URL Shortened Successfully!
+                            </h3>
+                            <div class="bg-accent rounded-md p-4 border border-border">
+                                <div class="flex items-start justify-between">
+                                    <div class="flex-1 min-w-0">
+                                        <p class="text-sm font-medium text-foreground mb-1">Original URL</p>
+                                        <p class="text-xs text-muted-foreground mb-3 break-all">${escapeHtml(data.original_url)}</p>
+                                        <p class="text-sm font-medium text-foreground mb-1">Short URL</p>
+                                        <div class="flex items-center space-x-2">
+                                            <a 
+                                                href="${escapeHtml(data.short_url)}" 
+                                                target="_blank" 
+                                                rel="noopener noreferrer"
+                                                class="text-sm text-primary hover:underline font-mono break-all"
+                                            >
+                                                ${escapeHtml(data.short_url)}
+                                            </a>
+                                            <button 
+                                                onclick="navigator.clipboard.writeText('${escapeHtml(data.short_url)}')"
+                                                class="ml-2 p-1 hover:bg-background rounded transition-colors"
+                                                title="Copy link"
+                                            >
+                                                <svg class="w-4 h-4 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                                                </svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                    
+                    // Auto-copy short URL to clipboard
+                    navigator.clipboard.writeText(data.short_url).catch(err => {
+                        console.error('Failed to copy to clipboard:', err);
+                    });
+                    
+                    // Clear form
+                    urlInput.value = '';
+                } else {
+                    urlError.textContent = data.error || 'Failed to shorten URL';
+                    urlError.classList.remove('hidden');
+                }
+            } catch (err) {
+                urlError.textContent = 'Failed to shorten URL: ' + err.message;
+                urlError.classList.remove('hidden');
+            } finally {
+                shortenBtn.disabled = false;
+                shortenText.textContent = 'Shorten URL';
+                shortenIcon.classList.remove('hidden');
+                shortenSpinner.classList.add('hidden');
             }
         });
 

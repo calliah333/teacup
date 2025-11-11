@@ -12,6 +12,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,9 +35,17 @@ type FileRecord struct {
 	Permanent  bool      `json:"permanent,omitempty"`
 }
 
+type URLRecord struct {
+	ShortCode   string    `json:"short_code"`
+	OriginalURL string    `json:"original_url"`
+	CreatedTime time.Time `json:"created_time"`
+}
+
 type Server struct {
 	filesJSON  string
 	filesMu    sync.RWMutex
+	urlsJSON   string
+	urlsMu     sync.RWMutex
 	uploadDir  string
 	ttl        time.Duration
 	indexTmpl  *template.Template
@@ -119,9 +128,11 @@ func NewServer(uploadDir string, ttl time.Duration, username, password string) (
 	}
 
 	filesJSON := filepath.Join(uploadDir, "files.json")
+	urlsJSON := filepath.Join(uploadDir, "urls.json")
 
 	server := &Server{
 		filesJSON: filesJSON,
+		urlsJSON:  urlsJSON,
 		uploadDir: uploadDir,
 		ttl:       ttl,
 		indexTmpl: tmpl,
@@ -130,14 +141,22 @@ func NewServer(uploadDir string, ttl time.Duration, username, password string) (
 		password:  strings.TrimSpace(password),
 	}
 
-	// Initialize JSON file if it doesn't exist
+	// Initialize JSON files if they don't exist
 	if err := server.initFiles(); err != nil {
 		return nil, fmt.Errorf("failed to initialize files storage: %w", err)
+	}
+	if err := server.initURLs(); err != nil {
+		return nil, fmt.Errorf("failed to initialize URLs storage: %w", err)
 	}
 
 	// Load existing files from JSON and start cleanup goroutines
 	if err := server.loadExistingFiles(); err != nil {
 		log.Printf("Warning: failed to load existing files: %v", err)
+	}
+
+	// Load existing URLs from JSON and start cleanup goroutines
+	if err := server.loadExistingURLs(); err != nil {
+		log.Printf("Warning: failed to load existing URLs: %v", err)
 	}
 
 	// Start session cleanup goroutine
@@ -153,6 +172,17 @@ func (s *Server) initFiles() error {
 	// If file doesn't exist, create it with empty array
 	if _, err := os.Stat(s.filesJSON); os.IsNotExist(err) {
 		return s.saveFilesLocked([]FileRecord{})
+	}
+	return nil
+}
+
+func (s *Server) initURLs() error {
+	s.urlsMu.Lock()
+	defer s.urlsMu.Unlock()
+
+	// If file doesn't exist, create it with empty array
+	if _, err := os.Stat(s.urlsJSON); os.IsNotExist(err) {
+		return s.saveURLsLocked([]URLRecord{})
 	}
 	return nil
 }
@@ -202,6 +232,51 @@ func (s *Server) saveFilesLocked(files []FileRecord) error {
 	return os.WriteFile(s.filesJSON, data, 0644)
 }
 
+func (s *Server) loadURLs() ([]URLRecord, error) {
+	s.urlsMu.RLock()
+	defer s.urlsMu.RUnlock()
+
+	return s.loadURLsLocked()
+}
+
+func (s *Server) loadURLsLocked() ([]URLRecord, error) {
+	// If file doesn't exist, return empty array
+	if _, err := os.Stat(s.urlsJSON); os.IsNotExist(err) {
+		return []URLRecord{}, nil
+	}
+
+	data, err := os.ReadFile(s.urlsJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	var urls []URLRecord
+	if len(data) == 0 {
+		return []URLRecord{}, nil
+	}
+
+	if err := json.Unmarshal(data, &urls); err != nil {
+		return nil, err
+	}
+
+	return urls, nil
+}
+
+func (s *Server) saveURLs(urls []URLRecord) error {
+	s.urlsMu.Lock()
+	defer s.urlsMu.Unlock()
+	return s.saveURLsLocked(urls)
+}
+
+func (s *Server) saveURLsLocked(urls []URLRecord) error {
+	data, err := json.MarshalIndent(urls, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(s.urlsJSON, data, 0644)
+}
+
 func (s *Server) loadExistingFiles() error {
 	files, err := s.loadFiles()
 	if err != nil {
@@ -248,10 +323,21 @@ func (s *Server) loadExistingFiles() error {
 	return nil
 }
 
+func (s *Server) loadExistingURLs() error {
+	// URLs are always permanent, no cleanup needed
+	return nil
+}
+
 func (s *Server) generateHash(filename string) string {
 	data := fmt.Sprintf("%s-%d", filename, time.Now().UnixNano())
 	hash := sha256.Sum256([]byte(data))
 	return hex.EncodeToString(hash[:])[:8]
+}
+
+func (s *Server) generateShortCode() string {
+	data := fmt.Sprintf("%d", time.Now().UnixNano())
+	hash := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(hash[:])[:6]
 }
 
 func (s *Server) generateSessionToken() (string, error) {
@@ -401,7 +487,176 @@ func (s *Server) checkAuthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		URL string `json:"url"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Invalid request",
+		})
+		return
+	}
+
+	// Validate URL
+	if req.URL == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "URL is required",
+		})
+		return
+	}
+
+	// Parse and validate URL format
+	parsedURL, err := url.Parse(req.URL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Invalid URL format",
+		})
+		return
+	}
+
+	// Ensure URL has a scheme
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "URL must use http or https scheme",
+		})
+		return
+	}
+
+	// Generate short code
+	shortCode := s.generateShortCode()
+
+	// Ensure short code is unique
+	urls, err := s.loadURLs()
+	if err != nil {
+		log.Printf("Error loading URLs: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Internal server error",
+		})
+		return
+	}
+
+	// Check for collisions (very unlikely but handle it)
+	for _, existingURL := range urls {
+		if existingURL.ShortCode == shortCode {
+			// Regenerate if collision
+			shortCode = s.generateShortCode()
+			break
+		}
+	}
+
+	createdTime := time.Now()
+
+	// Create URL record (always permanent)
+	urlRecord := URLRecord{
+		ShortCode:   shortCode,
+		OriginalURL: req.URL,
+		CreatedTime: createdTime,
+	}
+
+	// Save URL
+	urls = append(urls, urlRecord)
+	if err := s.saveURLs(urls); err != nil {
+		log.Printf("Error saving URL: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to save URL",
+		})
+		return
+	}
+
+	// Return success with short URL
+	shortURL := fmt.Sprintf("%s://%s/s/%s", func() string {
+		if r.TLS != nil {
+			return "https"
+		}
+		return "http"
+	}(), r.Host, shortCode)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":      true,
+		"short_url":    shortURL,
+		"short_code":   shortCode,
+		"original_url": req.URL,
+	})
+}
+
+func (s *Server) redirectHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract short code from path (e.g., "/s/abc123" -> "abc123")
+	path := strings.TrimPrefix(r.URL.Path, "/s/")
+	if path == "" || path == r.URL.Path {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Remove any trailing slashes or query parameters
+	shortCode := strings.Split(path, "/")[0]
+	shortCode = strings.Split(shortCode, "?")[0]
+
+	if shortCode == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Load URLs
+	urls, err := s.loadURLs()
+	if err != nil {
+		log.Printf("Error loading URLs: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Find matching URL
+	var originalURL string
+	var found bool
+	for _, urlRecord := range urls {
+		if urlRecord.ShortCode == shortCode {
+			originalURL = urlRecord.OriginalURL
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Redirect to original URL
+	http.Redirect(w, r, originalURL, http.StatusFound)
+}
+
 func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
+	// Handle URL shortener redirects
+	if strings.HasPrefix(r.URL.Path, "/s/") {
+		s.redirectHandler(w, r)
+		return
+	}
+
 	if r.URL.Path != "/" {
 		s.downloadHandler(w, r)
 		return
@@ -730,6 +985,56 @@ func (s *Server) deleteFile(hash string) {
 	log.Printf("Deleted expired file: %s (%s)", filename, hash)
 }
 
+func (s *Server) scheduleDeleteURL(shortCode string, ttl time.Duration) {
+	time.Sleep(ttl)
+	s.deleteURL(shortCode)
+}
+
+func (s *Server) removeURL(shortCode string) {
+	urls, err := s.loadURLs()
+	if err != nil {
+		log.Printf("Error loading URLs for removal: %v", err)
+		return
+	}
+
+	var updatedURLs []URLRecord
+	for _, url := range urls {
+		if url.ShortCode != shortCode {
+			updatedURLs = append(updatedURLs, url)
+		}
+	}
+
+	if err := s.saveURLs(updatedURLs); err != nil {
+		log.Printf("Error saving URLs after removal: %v", err)
+	}
+}
+
+func (s *Server) deleteURL(shortCode string) {
+	urls, err := s.loadURLs()
+	if err != nil {
+		log.Printf("Error loading URLs for deletion: %v", err)
+		return
+	}
+
+	var originalURL string
+	var found bool
+	for _, url := range urls {
+		if url.ShortCode == shortCode {
+			originalURL = url.OriginalURL
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return // Already deleted
+	}
+
+	// Delete from JSON
+	s.removeURL(shortCode)
+	log.Printf("Deleted expired URL: %s (%s)", originalURL, shortCode)
+}
+
 func (s *Server) cleanupRoutine() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
@@ -764,6 +1069,8 @@ func (s *Server) cleanupRoutine() {
 				log.Printf("Cleaned up expired file: %s (%s)", file.Filename, file.Hash)
 			}
 		}
+
+		// URLs are permanent, no cleanup needed
 	}
 }
 
@@ -796,6 +1103,7 @@ func main() {
 
 	http.HandleFunc("/", server.indexHandler)
 	http.HandleFunc("/upload", server.requireAuth(server.uploadHandler))
+	http.HandleFunc("/shorten", server.requireAuth(server.shortenHandler))
 	http.HandleFunc("/login", server.loginHandler)
 	http.HandleFunc("/logout", server.logoutHandler)
 	http.HandleFunc("/check-auth", server.checkAuthHandler)

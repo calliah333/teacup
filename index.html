@@ -207,6 +207,20 @@
                         class="w-full px-3 py-2 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
                     >
                 </div>
+                <div class="mb-4">
+                    <label for="customCodeInput" class="block text-sm font-medium mb-2">Custom short code (optional)</label>
+                    <input 
+                        type="text" 
+                        id="customCodeInput" 
+                        name="custom_code"
+                        placeholder="e.g., my-link"
+                        pattern="[a-zA-Z0-9_-]+"
+                        minlength="3"
+                        maxlength="20"
+                        class="w-full px-3 py-2 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                    >
+                    <p class="text-xs text-muted-foreground mt-1">3-20 characters, letters, numbers, hyphens, and underscores only. Leave empty for auto-generated short code.</p>
+                </div>
                 <div id="urlError" class="hidden bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4 text-sm mb-4"></div>
 
                 <!-- Shorten Button -->
@@ -227,22 +241,118 @@
             </form>
         </div>
 
-        <!-- Results Section -->
-        <div id="results" class="space-y-4 mb-6"></div>
+        <!-- Admin Panel Card -->
+        <div id="adminCard" class="bg-card text-card-foreground rounded-lg border border-border shadow-sm mb-6 p-6 hidden">
+            <h2 class="text-xl font-semibold mb-4">Admin</h2>
+            
+            <!-- Tabs -->
+            <div class="flex space-x-4 mb-6 border-b border-border">
+                <button 
+                    id="filesTab" 
+                    class="px-4 py-2 text-sm font-medium border-b-2 border-primary text-primary cursor-pointer transition-colors"
+                    data-tab="files"
+                >
+                    Files
+                </button>
+                <button 
+                    id="urlsTab" 
+                    class="px-4 py-2 text-sm font-medium border-b-2 border-transparent text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+                    data-tab="urls"
+                >
+                    Short URLs
+                </button>
+            </div>
 
-        <!-- Alert/Info Card -->
-        <div class="bg-blue-50 border border-blue-200 text-blue-900 rounded-lg p-4">
-            <div class="flex items-start space-x-3">
-                <svg class="w-5 h-5 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                </svg>
-                <div>
-                    <p class="text-sm font-medium">Expiration</p>
-                    <p class="text-sm text-blue-700 mt-1">Files expire by default after 3 hours. You can customize the time or mark uploads as permanent.</p>
+            <!-- Files Tab Content -->
+            <div id="filesTabContent" class="space-y-4">
+                <div class="flex items-center justify-between mb-4">
+                    <p class="text-sm text-muted-foreground">Total files: <span id="filesCount">0</span></p>
+                    <button 
+                        id="refreshFilesBtn" 
+                        class="bg-secondary text-secondary-foreground hover:bg-secondary/80 font-medium py-1 px-3 rounded-md text-sm transition-colors"
+                    >
+                        Refresh
+                    </button>
+                </div>
+                <div id="filesContainer" class="border border-border rounded-lg overflow-hidden">
+                    <div class="bg-secondary/50 px-4 py-3 text-sm font-semibold grid grid-cols-12 gap-4">
+                        <div class="col-span-3">Filename</div>
+                        <div class="col-span-2">Uploaded</div>
+                        <div class="col-span-2">Status</div>
+                        <div class="col-span-3">Actions</div>
+                    </div>
+                    <div id="filesList" class="divide-y divide-border">
+                        <div class="px-4 py-8 text-center text-muted-foreground text-sm">Loading files...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- URLs Tab Content -->
+            <div id="urlsTabContent" class="space-y-4 hidden">
+                <div class="flex items-center justify-between mb-4">
+                    <p class="text-sm text-muted-foreground">Total URLs: <span id="urlsCount">0</span></p>
+                    <button 
+                        id="refreshUrlsBtn" 
+                        class="bg-secondary text-secondary-foreground hover:bg-secondary/80 font-medium py-1 px-3 rounded-md text-sm transition-colors"
+                    >
+                        Refresh
+                    </button>
+                </div>
+                <div id="urlsContainer" class="border border-border rounded-lg overflow-hidden">
+                    <div class="bg-secondary/50 px-4 py-3 text-sm font-semibold grid grid-cols-12 gap-4">
+                        <div class="col-span-2">Short Code</div>
+                        <div class="col-span-5">Original URL</div>
+                        <div class="col-span-3">Created</div>
+                        <div class="col-span-2">Action</div>
+                    </div>
+                    <div id="urlsList" class="divide-y divide-border">
+                        <div class="px-4 py-8 text-center text-muted-foreground text-sm">Loading URLs...</div>
+                    </div>
                 </div>
             </div>
         </div>
-    </div>
+
+        <!-- File Viewer Modal -->
+        <div id="fileViewerModal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+            <div class="bg-card rounded-lg max-w-4xl w-full max-h-[90vh] overflow-hidden flex flex-col border border-border shadow-lg">
+                <!-- Modal Header -->
+                <div class="bg-secondary/50 px-6 py-4 border-b border-border flex items-center justify-between">
+                    <div>
+                        <h3 class="text-lg font-semibold text-foreground">File Preview</h3>
+                        <p id="fileViewerName" class="text-sm text-muted-foreground mt-1"></p>
+                    </div>
+                    <button 
+                        onclick="closeFileViewer()"
+                        class="text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+                
+                <!-- Modal Content -->
+                <div id="fileViewerContent" class="flex-1 overflow-auto bg-background">
+                    <!-- Content will be loaded here -->
+                </div>
+                
+                <!-- Modal Footer -->
+                <div class="bg-secondary/50 px-6 py-4 border-t border-border flex items-center justify-between">
+                    <a id="fileViewerDownloadLink" href="#" target="_blank" rel="noopener noreferrer" class="bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2 rounded-md text-sm font-medium transition-colors">
+                        Download
+                    </a>
+                    <button 
+                        onclick="closeFileViewer()"
+                        class="bg-secondary text-secondary-foreground hover:bg-secondary/80 px-4 py-2 rounded-md text-sm font-medium transition-colors"
+                    >
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Results Section -->
+        <div id="results" class="space-y-4 mb-6"></div>
 
     <script>
         const dropZone = document.getElementById('dropZone');
@@ -269,11 +379,31 @@
         const urlShortenerCard = document.getElementById('urlShortenerCard');
         const shortenForm = document.getElementById('shortenForm');
         const urlInput = document.getElementById('urlInput');
+        const customCodeInput = document.getElementById('customCodeInput');
         const shortenBtn = document.getElementById('shortenBtn');
         const shortenText = document.getElementById('shortenText');
         const shortenIcon = document.getElementById('shortenIcon');
         const shortenSpinner = document.getElementById('shortenSpinner');
         const urlError = document.getElementById('urlError');
+
+        // Admin panel elements
+        const adminCard = document.getElementById('adminCard');
+        const filesTab = document.getElementById('filesTab');
+        const urlsTab = document.getElementById('urlsTab');
+        const filesTabContent = document.getElementById('filesTabContent');
+        const urlsTabContent = document.getElementById('urlsTabContent');
+        const filesList = document.getElementById('filesList');
+        const urlsList = document.getElementById('urlsList');
+        const filesCount = document.getElementById('filesCount');
+        const urlsCount = document.getElementById('urlsCount');
+        const refreshFilesBtn = document.getElementById('refreshFilesBtn');
+        const refreshUrlsBtn = document.getElementById('refreshUrlsBtn');
+
+        // File viewer modal elements
+        const fileViewerModal = document.getElementById('fileViewerModal');
+        const fileViewerContent = document.getElementById('fileViewerContent');
+        const fileViewerName = document.getElementById('fileViewerName');
+        const fileViewerDownloadLink = document.getElementById('fileViewerDownloadLink');
 
         const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB in bytes
 
@@ -298,11 +428,16 @@
                 loginCard.classList.add('hidden');
                 uploadCard.classList.remove('hidden');
                 urlShortenerCard.classList.remove('hidden');
+                adminCard.classList.remove('hidden');
                 logoutBtn.classList.remove('hidden');
+                // Load admin data when authenticated
+                loadFiles();
+                loadURLs();
             } else {
                 loginCard.classList.remove('hidden');
                 uploadCard.classList.add('hidden');
                 urlShortenerCard.classList.add('hidden');
+                adminCard.classList.add('hidden');
                 logoutBtn.classList.add('hidden');
                 results.innerHTML = '';
             }
@@ -803,6 +938,7 @@
             e.preventDefault();
             
             const url = urlInput.value.trim();
+            const customCode = customCodeInput.value.trim();
             
             if (!url) {
                 urlError.textContent = 'Please enter a URL';
@@ -817,14 +953,17 @@
             urlError.classList.add('hidden');
             
             try {
+                const requestBody = { url: url };
+                if (customCode) {
+                    requestBody.custom_code = customCode;
+                }
+                
                 const response = await fetch('/shorten', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        url: url,
-                    }),
+                    body: JSON.stringify(requestBody),
                 });
                 
                 // Handle authentication errors
@@ -890,6 +1029,7 @@
                     
                     // Clear form
                     urlInput.value = '';
+                    customCodeInput.value = '';
                 } else {
                     urlError.textContent = data.error || 'Failed to shorten URL';
                     urlError.classList.remove('hidden');
@@ -910,6 +1050,343 @@
             div.textContent = text;
             return div.innerHTML;
         }
+
+        // Admin Panel Functions
+        async function loadFiles() {
+            try {
+                const response = await fetch('/api/files');
+                if (response.status === 401) {
+                    isAuthenticated = false;
+                    updateUI();
+                    return;
+                }
+
+                const data = await response.json();
+                if (!data.success) {
+                    filesList.innerHTML = `<div class="px-4 py-8 text-center text-destructive text-sm">Failed to load files</div>`;
+                    return;
+                }
+
+                const files = data.files || [];
+                filesCount.textContent = files.length;
+
+                if (files.length === 0) {
+                    filesList.innerHTML = `<div class="px-4 py-8 text-center text-muted-foreground text-sm">No files uploaded</div>`;
+                    return;
+                }
+
+                let html = '';
+                files.forEach(file => {
+                    const uploadDate = new Date(file.upload_time);
+                    const uploadTime = uploadDate.toLocaleDateString() + ' ' + uploadDate.toLocaleTimeString();
+                    let status = 'Permanent';
+                    
+                    if (!file.permanent && file.remaining_ttl !== undefined) {
+                        if (file.remaining_ttl > 0) {
+                            const hours = Math.floor(file.remaining_ttl / 3600);
+                            const minutes = Math.floor((file.remaining_ttl % 3600) / 60);
+                            status = `Expires in ${hours}h ${minutes}m`;
+                        } else {
+                            status = 'Expired';
+                        }
+                    }
+
+                    html += `
+                        <div class="px-4 py-3 grid grid-cols-12 gap-4 items-center hover:bg-accent/50 transition-colors">
+                            <div class="col-span-3 text-sm truncate" title="${escapeHtml(file.filename)}">
+                                ${escapeHtml(file.filename)}
+                            </div>
+                            <div class="col-span-2 text-sm text-muted-foreground">
+                                ${uploadTime}
+                            </div>
+                            <div class="col-span-2 text-sm">
+                                <span class="inline-block px-2 py-1 rounded text-xs font-medium ${file.permanent ? 'bg-blue-100 text-blue-900' : 'bg-yellow-100 text-yellow-900'}">
+                                    ${status}
+                                </span>
+                            </div>
+                            <div class="col-span-3 text-sm space-x-1 flex">
+                                <button 
+                                    onclick="viewFile('${file.hash}', '${file.filename.replace(/'/g, "\\'")}')"
+                                    class="bg-primary text-primary-foreground hover:bg-primary/90 px-2 py-1 rounded text-xs font-medium transition-colors"
+                                >
+                                    View
+                                </button>
+                                <button 
+                                    onclick="deleteFile('${file.hash}')"
+                                    class="bg-destructive text-destructive-foreground hover:bg-destructive/90 px-2 py-1 rounded text-xs font-medium transition-colors"
+                                >
+                                    Delete
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                filesList.innerHTML = html;
+            } catch (err) {
+                console.error('Error loading files:', err);
+                filesList.innerHTML = `<div class="px-4 py-8 text-center text-destructive text-sm">Error loading files</div>`;
+            }
+        }
+
+        async function loadURLs() {
+            try {
+                const response = await fetch('/api/urls');
+                if (response.status === 401) {
+                    isAuthenticated = false;
+                    updateUI();
+                    return;
+                }
+
+                const data = await response.json();
+                if (!data.success) {
+                    urlsList.innerHTML = `<div class="px-4 py-8 text-center text-destructive text-sm">Failed to load URLs</div>`;
+                    return;
+                }
+
+                const urls = data.urls || [];
+                urlsCount.textContent = urls.length;
+
+                if (urls.length === 0) {
+                    urlsList.innerHTML = `<div class="px-4 py-8 text-center text-muted-foreground text-sm">No shortened URLs</div>`;
+                    return;
+                }
+
+                let html = '';
+                urls.forEach(url => {
+                    const createdDate = new Date(url.created_time);
+                    const createdTime = createdDate.toLocaleDateString() + ' ' + createdDate.toLocaleTimeString();
+                    const shortLink = `${window.location.origin}/s/${url.short_code}`;
+
+                    html += `
+                        <div class="px-4 py-3 grid grid-cols-12 gap-4 items-center hover:bg-accent/50 transition-colors">
+                            <div class="col-span-2 text-sm font-mono text-primary">
+                                ${escapeHtml(url.short_code)}
+                            </div>
+                            <div class="col-span-5 text-sm text-muted-foreground truncate" title="${escapeHtml(url.original_url)}">
+                                ${escapeHtml(url.original_url)}
+                            </div>
+                            <div class="col-span-3 text-sm text-muted-foreground">
+                                ${createdTime}
+                            </div>
+                            <div class="col-span-2 text-sm">
+                                <button 
+                                    onclick="deleteURL('${url.short_code}')"
+                                    class="bg-destructive text-destructive-foreground hover:bg-destructive/90 px-2 py-1 rounded text-xs font-medium transition-colors"
+                                >
+                                    Delete
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                urlsList.innerHTML = html;
+            } catch (err) {
+                console.error('Error loading URLs:', err);
+                urlsList.innerHTML = `<div class="px-4 py-8 text-center text-destructive text-sm">Error loading URLs</div>`;
+            }
+        }
+
+        async function deleteFile(hash) {
+            if (!confirm('Are you sure you want to delete this file?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/files/${hash}`, {
+                    method: 'DELETE',
+                });
+
+                if (response.status === 401) {
+                    isAuthenticated = false;
+                    updateUI();
+                    return;
+                }
+
+                const data = await response.json();
+                if (data.success) {
+                    loadFiles();
+                } else {
+                    alert(data.error || 'Failed to delete file');
+                }
+            } catch (err) {
+                console.error('Error deleting file:', err);
+                alert('Error deleting file: ' + err.message);
+            }
+        }
+
+        async function deleteURL(shortCode) {
+            if (!confirm('Are you sure you want to delete this URL shortcut?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/urls/${shortCode}`, {
+                    method: 'DELETE',
+                });
+
+                if (response.status === 401) {
+                    isAuthenticated = false;
+                    updateUI();
+                    return;
+                }
+
+                const data = await response.json();
+                if (data.success) {
+                    loadURLs();
+                } else {
+                    alert(data.error || 'Failed to delete URL');
+                }
+            } catch (err) {
+                console.error('Error deleting URL:', err);
+                alert('Error deleting URL: ' + err.message);
+            }
+        }
+
+        async function viewFile(hash, filename) {
+            // Get file extension from filename
+            const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase();
+            const fileUrl = `/${hash}${ext}`;
+            
+            // Update modal header
+            fileViewerName.textContent = filename;
+            fileViewerDownloadLink.href = fileUrl;
+            
+            // Show modal
+            fileViewerModal.classList.remove('hidden');
+            
+            // Load and display file content
+            try {
+                const response = await fetch(fileUrl);
+                
+                if (!response.ok) {
+                    fileViewerContent.innerHTML = `<div class="p-6 text-center text-destructive"><p>Error loading file</p></div>`;
+                    return;
+                }
+                
+                const contentType = response.headers.get('content-type') || '';
+                
+                // Image files
+                if (contentType.startsWith('image/')) {
+                    const blob = await response.blob();
+                    const objectUrl = URL.createObjectURL(blob);
+                    fileViewerContent.innerHTML = `
+                        <div class="p-6 flex items-center justify-center">
+                            <img src="${objectUrl}" alt="${escapeHtml(filename)}" class="max-w-full max-h-[calc(90vh-200px)] object-contain rounded">
+                        </div>
+                    `;
+                }
+                // PDF files
+                else if (contentType === 'application/pdf' || ext === '.pdf') {
+                    const blob = await response.blob();
+                    const objectUrl = URL.createObjectURL(blob);
+                    fileViewerContent.innerHTML = `
+                        <div class="p-6 h-full">
+                            <iframe src="${objectUrl}" class="w-full h-full rounded border border-border"></iframe>
+                        </div>
+                    `;
+                }
+                // Text files
+                else if (contentType.startsWith('text/') || ['.txt', '.json', '.xml', '.csv', '.log', '.md', '.html', '.css', '.js', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.h'].includes(ext)) {
+                    const text = await response.text();
+                    const displayText = text.length > 100000 
+                        ? text.substring(0, 100000) + '\n\n... [File truncated - too large to display in browser]'
+                        : text;
+                    fileViewerContent.innerHTML = `
+                        <div class="p-6">
+                            <pre class="bg-secondary/50 p-4 rounded overflow-auto max-h-[calc(90vh-200px)] text-sm font-mono text-foreground border border-border"><code>${escapeHtml(displayText)}</code></pre>
+                        </div>
+                    `;
+                }
+                // Audio files
+                else if (contentType.startsWith('audio/') || ['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg'].includes(ext)) {
+                    const blob = await response.blob();
+                    const objectUrl = URL.createObjectURL(blob);
+                    fileViewerContent.innerHTML = `
+                        <div class="p-6 flex items-center justify-center">
+                            <div class="w-full max-w-md">
+                                <p class="text-sm text-muted-foreground mb-4">Audio Player</p>
+                                <audio controls class="w-full">
+                                    <source src="${objectUrl}" type="${contentType}">
+                                    Your browser does not support the audio element.
+                                </audio>
+                            </div>
+                        </div>
+                    `;
+                }
+                // Video files
+                else if (contentType.startsWith('video/') || ['.mp4', '.webm', '.mkv', '.mov', '.avi'].includes(ext)) {
+                    const blob = await response.blob();
+                    const objectUrl = URL.createObjectURL(blob);
+                    fileViewerContent.innerHTML = `
+                        <div class="p-6 flex items-center justify-center">
+                            <video controls class="max-w-full max-h-[calc(90vh-200px)] rounded">
+                                <source src="${objectUrl}" type="${contentType}">
+                                Your browser does not support the video element.
+                            </video>
+                        </div>
+                    `;
+                }
+                // Unsupported file types
+                else {
+                    fileViewerContent.innerHTML = `
+                        <div class="p-6 text-center text-muted-foreground">
+                            <svg class="w-16 h-16 mx-auto mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                            </svg>
+                            <p class="text-sm mb-2">File preview not supported</p>
+                            <p class="text-xs">File type: <span class="font-mono">${escapeHtml(ext || 'unknown')}</span></p>
+                            <p class="text-xs mt-2">Click "Download" to view this file</p>
+                        </div>
+                    `;
+                }
+            } catch (err) {
+                console.error('Error loading file:', err);
+                fileViewerContent.innerHTML = `<div class="p-6 text-center text-destructive"><p>Error loading file: ${escapeHtml(err.message)}</p></div>`;
+            }
+        }
+
+        function closeFileViewer() {
+            fileViewerModal.classList.add('hidden');
+            fileViewerContent.innerHTML = '';
+        }
+
+        // Close modal when clicking outside
+        fileViewerModal.addEventListener('click', (e) => {
+            if (e.target === fileViewerModal) {
+                closeFileViewer();
+            }
+        });
+
+        // Close modal on Escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && !fileViewerModal.classList.contains('hidden')) {
+                closeFileViewer();
+            }
+        });
+
+        // Admin tab switching
+        filesTab.addEventListener('click', () => {
+            filesTabContent.classList.remove('hidden');
+            urlsTabContent.classList.add('hidden');
+            filesTab.classList.remove('border-transparent', 'text-muted-foreground', 'hover:text-foreground');
+            filesTab.classList.add('border-primary', 'text-primary');
+            urlsTab.classList.remove('border-primary', 'text-primary');
+            urlsTab.classList.add('border-transparent', 'text-muted-foreground', 'hover:text-foreground');
+        });
+
+        urlsTab.addEventListener('click', () => {
+            filesTabContent.classList.add('hidden');
+            urlsTabContent.classList.remove('hidden');
+            filesTab.classList.remove('border-primary', 'text-primary');
+            filesTab.classList.add('border-transparent', 'text-muted-foreground', 'hover:text-foreground');
+            urlsTab.classList.remove('border-transparent', 'text-muted-foreground', 'hover:text-foreground');
+            urlsTab.classList.add('border-primary', 'text-primary');
+        });
+
+        refreshFilesBtn.addEventListener('click', loadFiles);
+        refreshUrlsBtn.addEventListener('click', loadURLs);
 
         // Initialize on page load
         checkAuth();

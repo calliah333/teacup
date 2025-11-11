@@ -487,6 +487,249 @@ func (s *Server) checkAuthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) listFilesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	files, err := s.loadFiles()
+	if err != nil {
+		log.Printf("Error loading files: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to load files",
+		})
+		return
+	}
+
+	// Calculate remaining TTL for each file
+	type FileInfo struct {
+		Hash         string    `json:"hash"`
+		Filename     string    `json:"filename"`
+		UploadTime   time.Time `json:"upload_time"`
+		Permanent    bool      `json:"permanent"`
+		TTLSeconds   int64     `json:"ttl_seconds,omitempty"`
+		RemainingTTL int64     `json:"remaining_ttl,omitempty"`
+		FilePath     string    `json:"file_path"`
+	}
+
+	var fileInfos []FileInfo
+	now := time.Now()
+
+	for _, file := range files {
+		info := FileInfo{
+			Hash:       file.Hash,
+			Filename:   file.Filename,
+			UploadTime: file.UploadTime,
+			Permanent:  file.Permanent,
+			TTLSeconds: file.TTLSeconds,
+			FilePath:   file.FilePath,
+		}
+
+		if !file.Permanent {
+			expiresAt := file.UploadTime.Add(time.Duration(file.TTLSeconds) * time.Second)
+			remaining := expiresAt.Sub(now).Seconds()
+			if remaining > 0 {
+				info.RemainingTTL = int64(remaining)
+			} else {
+				info.RemainingTTL = 0
+			}
+		}
+
+		fileInfos = append(fileInfos, info)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"files":   fileInfos,
+	})
+}
+
+func (s *Server) listURLsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	urls, err := s.loadURLs()
+	if err != nil {
+		log.Printf("Error loading URLs: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to load URLs",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"urls":    urls,
+	})
+}
+
+func (s *Server) deleteFileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract hash from URL path (e.g., "/api/files/abc123" -> hash="abc123")
+	hash := strings.TrimPrefix(r.URL.Path, "/api/files/")
+	if hash == "" || hash == r.URL.Path {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Hash is required",
+		})
+		return
+	}
+
+	// Find and delete the file
+	files, err := s.loadFiles()
+	if err != nil {
+		log.Printf("Error loading files: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to load files",
+		})
+		return
+	}
+
+	var found bool
+	var filePath, filename string
+	var updatedFiles []FileRecord
+
+	for _, file := range files {
+		if file.Hash == hash {
+			found = true
+			filePath = file.FilePath
+			filename = file.Filename
+		} else {
+			updatedFiles = append(updatedFiles, file)
+		}
+	}
+
+	if !found {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "File not found",
+		})
+		return
+	}
+
+	// Delete file from disk
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Error deleting file %s: %v", filePath, err)
+	}
+
+	// Save updated file list
+	if err := s.saveFiles(updatedFiles); err != nil {
+		log.Printf("Error saving files: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to delete file",
+		})
+		return
+	}
+
+	log.Printf("Admin deleted file: %s (%s)", filename, hash)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "File deleted successfully",
+	})
+}
+
+func (s *Server) deleteURLHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract short code from URL path (e.g., "/api/urls/abc123" -> code="abc123")
+	shortCode := strings.TrimPrefix(r.URL.Path, "/api/urls/")
+	if shortCode == "" || shortCode == r.URL.Path {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Short code is required",
+		})
+		return
+	}
+
+	// Find and delete the URL
+	urls, err := s.loadURLs()
+	if err != nil {
+		log.Printf("Error loading URLs: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to load URLs",
+		})
+		return
+	}
+
+	var found bool
+	var originalURL string
+	var updatedURLs []URLRecord
+
+	for _, url := range urls {
+		if url.ShortCode == shortCode {
+			found = true
+			originalURL = url.OriginalURL
+		} else {
+			updatedURLs = append(updatedURLs, url)
+		}
+	}
+
+	if !found {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "URL not found",
+		})
+		return
+	}
+
+	// Save updated URL list
+	if err := s.saveURLs(updatedURLs); err != nil {
+		log.Printf("Error saving URLs: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to delete URL",
+		})
+		return
+	}
+
+	log.Printf("Admin deleted URL: %s (%s)", originalURL, shortCode)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "URL deleted successfully",
+	})
+}
+
 func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -494,7 +737,8 @@ func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		URL string `json:"url"`
+		URL        string `json:"url"`
+		CustomCode string `json:"custom_code,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -541,10 +785,7 @@ func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate short code
-	shortCode := s.generateShortCode()
-
-	// Ensure short code is unique
+	// Load existing URLs
 	urls, err := s.loadURLs()
 	if err != nil {
 		log.Printf("Error loading URLs: %v", err)
@@ -557,12 +798,66 @@ func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check for collisions (very unlikely but handle it)
-	for _, existingURL := range urls {
-		if existingURL.ShortCode == shortCode {
-			// Regenerate if collision
-			shortCode = s.generateShortCode()
-			break
+	var shortCode string
+	if req.CustomCode != "" {
+		// Validate custom code
+		customCode := strings.TrimSpace(req.CustomCode)
+		if len(customCode) < 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "Custom code must be at least 3 characters long",
+			})
+			return
+		}
+		if len(customCode) > 20 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "Custom code must be at most 20 characters long",
+			})
+			return
+		}
+		// Only allow alphanumeric characters, hyphens, and underscores
+		for _, c := range customCode {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"error":   "Custom code can only contain letters, numbers, hyphens, and underscores",
+				})
+				return
+			}
+		}
+
+		// Check if custom code is already taken
+		for _, existingURL := range urls {
+			if existingURL.ShortCode == customCode {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"error":   "Custom code is already taken",
+				})
+				return
+			}
+		}
+
+		shortCode = customCode
+	} else {
+		// Generate short code
+		shortCode = s.generateShortCode()
+
+		// Check for collisions (very unlikely but handle it)
+		for _, existingURL := range urls {
+			if existingURL.ShortCode == shortCode {
+				// Regenerate if collision
+				shortCode = s.generateShortCode()
+				break
+			}
 		}
 	}
 
@@ -1107,6 +1402,10 @@ func main() {
 	http.HandleFunc("/login", server.loginHandler)
 	http.HandleFunc("/logout", server.logoutHandler)
 	http.HandleFunc("/check-auth", server.checkAuthHandler)
+	http.HandleFunc("/api/files", server.requireAuth(server.listFilesHandler))
+	http.HandleFunc("/api/urls", server.requireAuth(server.listURLsHandler))
+	http.HandleFunc("/api/files/", server.requireAuth(server.deleteFileHandler))
+	http.HandleFunc("/api/urls/", server.requireAuth(server.deleteURLHandler))
 
 	log.Printf("Server starting on %s", port)
 	log.Printf("Files will expire after %v", ttl)

@@ -2,3 +2,4 @@ teacup
 uploads/
 .DS_Store
 config
+.env

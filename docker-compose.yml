@@ -2,7 +2,7 @@ services:
   teacup:
     build: .
     ports:
-      - "8080:8080"
+      - "${PORT}:${PORT}"
     volumes:
       - ./uploads:/app/uploads
     environment:

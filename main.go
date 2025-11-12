@@ -1371,13 +1371,13 @@ func (s *Server) cleanupRoutine() {
 
 func main() {
 	// Load credentials from config file
-	configPath := "config"
+	configPath := ".env"
 
 	username, password, port, err := loadCredentials(configPath)
 	if err != nil {
 		log.Fatal("Failed to load credentials:", err)
 	}
-	log.Printf("Loaded credentials: username=%s, password=%s, port=%s", username, password, port)
+	log.Printf("Loaded credentials: USERNAME=%s, PASSWORD=%s, PORT=%s", username, password, port)
 
 	uploadDir := "./uploads"
 	if uploadEnv := os.Getenv("UPLOAD_DIR"); uploadEnv != "" {

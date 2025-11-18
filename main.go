@@ -21,9 +21,8 @@ import (
 	"time"
 )
 
-const (
-	maxFileSize = 100 << 20 // 100 MB per file
-	maxFormSize = 500 << 20 // 500 MB total form size (allows multiple files)
+var (
+	maxFileSize int64 = 100 << 20 // 100 MB per file (default)
 )
 
 type FileRecord struct {
@@ -55,17 +54,18 @@ type Server struct {
 	password   string
 }
 
-func loadCredentials(configPath string) (string, string, string, error) {
+func loadCredentials(configPath string) (string, string, string, int64, error) {
 	var username, password, port string
+	var maxFileSizeMB int64 = 100 // defaults
 
 	// Config file must exist
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return "", "", "", fmt.Errorf("config file not found at %s", configPath)
+		return "", "", "", 0, fmt.Errorf("config file not found at %s", configPath)
 	}
 
 	file, err := os.Open(configPath)
 	if err != nil {
-		return "", "", "", fmt.Errorf("failed to open config file: %w", err)
+		return "", "", "", 0, fmt.Errorf("failed to open config file: %w", err)
 	}
 	defer file.Close()
 
@@ -93,19 +93,23 @@ func loadCredentials(configPath string) (string, string, string, error) {
 			password = value
 		case "port":
 			port = value
+		case "max_file_size_mb":
+			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
+				maxFileSizeMB = v
+			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return "", "", "", fmt.Errorf("error reading config file: %w", err)
+		return "", "", "", 0, fmt.Errorf("error reading config file: %w", err)
 	}
 
 	if username == "" {
-		return "", "", "", fmt.Errorf("username not found in config file")
+		return "", "", "", 0, fmt.Errorf("username not found in config file")
 	}
 
 	if password == "" {
-		return "", "", "", fmt.Errorf("password not found in config file")
+		return "", "", "", 0, fmt.Errorf("password not found in config file")
 	}
 
 	// Default port if not specified
@@ -118,7 +122,7 @@ func loadCredentials(configPath string) (string, string, string, error) {
 		port = ":" + port
 	}
 
-	return username, password, port, nil
+	return username, password, port, maxFileSizeMB, nil
 }
 
 func NewServer(uploadDir string, ttl time.Duration, username, password string) (*Server, error) {
@@ -484,6 +488,13 @@ func (s *Server) checkAuthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"authenticated": authenticated,
+	})
+}
+
+func (s *Server) configHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"maxFileSizeBytes": maxFileSize,
 	})
 }
 
@@ -966,8 +977,11 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Allow larger request bodies
+	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize*10)
+
 	// Set max memory for parsing form
-	r.ParseMultipartForm(maxFormSize)
+	r.ParseMultipartForm(maxFileSize * 10)
 
 	files := r.MultipartForm.File["files"]
 	if len(files) == 0 {
@@ -1117,6 +1131,7 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		if !permanent {
 			go s.scheduleDelete(hash, perFileTTL)
 		}
+		log.Printf("Uploaded file. Written to:  %v", filePath)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1373,11 +1388,16 @@ func main() {
 	// Load credentials from config file
 	configPath := ".env"
 
-	username, password, port, err := loadCredentials(configPath)
+	username, password, port, fileSizeMB, err := loadCredentials(configPath)
 	if err != nil {
 		log.Fatal("Failed to load credentials:", err)
 	}
+
+	// Set global variables from config
+	maxFileSize = fileSizeMB << 20
+
 	log.Printf("Loaded credentials: USERNAME=%s, PASSWORD=%s, PORT=%s", username, password, port)
+	log.Printf("File size limit: %d MB", maxFileSize/(1<<20))
 
 	uploadDir := "./uploads"
 	if uploadEnv := os.Getenv("UPLOAD_DIR"); uploadEnv != "" {
@@ -1402,6 +1422,7 @@ func main() {
 	http.HandleFunc("/login", server.loginHandler)
 	http.HandleFunc("/logout", server.logoutHandler)
 	http.HandleFunc("/check-auth", server.checkAuthHandler)
+	http.HandleFunc("/config", server.configHandler)
 	http.HandleFunc("/api/files", server.requireAuth(server.listFilesHandler))
 	http.HandleFunc("/api/urls", server.requireAuth(server.listURLsHandler))
 	http.HandleFunc("/api/files/", server.requireAuth(server.deleteFileHandler))

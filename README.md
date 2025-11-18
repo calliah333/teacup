@@ -1,5 +1,11 @@
-this is high key some ai nonsense. use at your own risk
+My take on a simple temp file 
 
-fill out the config and remove the .example part. figure out the rest
+![Interface](assets/interface.png)
 
-this is simple by design. just uses golang stdlib
+# Usage:
+
+Fill out the .env.example and remove the .example
+
+Dockerfile and compose are included 
+
+If you are hosting this behind cloudflare, keep in mind they have a 100MB cap for proxied files.

@@ -1,8 +1,6 @@
-My take on a simple temp file 
-
 ![Interface](assets/interface.png)
 
-# Usage:
+# Usage
 
 Fill out the .env.example and remove the .example
 

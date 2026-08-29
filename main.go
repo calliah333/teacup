@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -52,6 +53,12 @@ type Server struct {
 	sessionsMu sync.RWMutex
 	username   string
 	password   string
+	tempAuth   map[string]tempCredential
+}
+
+type tempCredential struct {
+	password string
+	expires  time.Time
 }
 
 func loadCredentials(configPath string) (string, string, string, int64, error) {
@@ -143,6 +150,7 @@ func NewServer(uploadDir string, ttl time.Duration, username, password string) (
 		sessions:  make(map[string]time.Time),
 		username:  strings.TrimSpace(username),
 		password:  strings.TrimSpace(password),
+		tempAuth:  make(map[string]tempCredential),
 	}
 
 	// Initialize JSON files if they don't exist
@@ -403,16 +411,50 @@ func (s *Server) requireAuth(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionToken := s.getSessionToken(r)
 		if !s.isValidSession(sessionToken) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   "Authentication required",
-			})
-			return
+			username, password, ok := r.BasicAuth()
+			tempOK := false
+			if ok {
+				s.sessionsMu.RLock()
+				credential, exists := s.tempAuth[username]
+				s.sessionsMu.RUnlock()
+				tempOK = exists && credential.password == password && credential.expires.After(time.Now())
+			}
+			if !ok || (!tempOK && (username != s.username || password != s.password)) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"error":   "Authentication required",
+				})
+				return
+			}
 		}
 		fn(w, r)
 	}
+}
+
+func (s *Server) curlCredentialsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	username, err := s.generateSessionToken()
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	password, err := s.generateSessionToken()
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	username = "temp-" + username[:12]
+	expires := time.Now().Add(5 * time.Minute)
+	s.sessionsMu.Lock()
+	s.tempAuth[username] = tempCredential{password: password, expires: expires}
+	s.sessionsMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"username": username, "password": password, "expires": expires})
 }
 
 func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
@@ -971,6 +1013,14 @@ func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
 	s.indexTmpl.Execute(w, nil)
 }
 
+func absoluteURL(r *http.Request, path string) string {
+	scheme := "http"
+	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host + path
+}
+
 func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -983,7 +1033,13 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Set max memory for parsing form
 	r.ParseMultipartForm(maxFileSize * 10)
 
-	files := r.MultipartForm.File["files"]
+	var files []*multipart.FileHeader
+	if r.MultipartForm != nil {
+		files = r.MultipartForm.File["files"]
+		if len(files) == 0 {
+			files = r.MultipartForm.File["file"]
+		}
+	}
 	if len(files) == 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -998,6 +1054,7 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		Hash      string `json:"hash"`
 		Filename  string `json:"filename"`
 		Extension string `json:"extension"`
+		URL       string `json:"url"`
 	}
 
 	type UploadError struct {
@@ -1126,6 +1183,7 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 			Hash:      hash,
 			Filename:  fileHeader.Filename,
 			Extension: ext,
+			URL:       absoluteURL(r, "/"+hash+ext),
 		})
 
 		if !permanent {
@@ -1418,6 +1476,7 @@ func main() {
 
 	http.HandleFunc("/", server.indexHandler)
 	http.HandleFunc("/upload", server.requireAuth(server.uploadHandler))
+	http.HandleFunc("/api/curl-credentials", server.requireAuth(server.curlCredentialsHandler))
 	http.HandleFunc("/shorten", server.requireAuth(server.shortenHandler))
 	http.HandleFunc("/login", server.loginHandler)
 	http.HandleFunc("/logout", server.logoutHandler)

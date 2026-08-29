@@ -173,6 +173,13 @@
                     </div>
                 </div>
             </form>
+            <div class="mt-4 rounded-lg border border-border bg-secondary/30 p-4">
+                <div class="flex items-center justify-between gap-3 mb-2">
+                    <h3 class="text-sm font-semibold">Upload with curl</h3>
+                    <button id="copyCurlBtn" type="button" class="text-xs px-3 py-1.5 border border-input rounded-md hover:bg-accent transition-colors">Copy command</button>
+                </div>
+                <pre class="text-xs text-muted-foreground whitespace-pre-wrap break-all"><code id="curlCommand"></code></pre>
+            </div>
         </div>
 
         <!-- URL Shortener Card -->
@@ -364,7 +371,21 @@
         const shortenIcon = document.getElementById('shortenIcon');
         const shortenSpinner = document.getElementById('shortenSpinner');
         const urlError = document.getElementById('urlError');
+        const curlCommand = document.getElementById('curlCommand');
+        const copyCurlBtn = document.getElementById('copyCurlBtn');
 
+        curlCommand.textContent = `curl -u username:password -F 'file=@./path/to/file' ${location.origin}/upload`;
+        async function refreshCurlCredentials() {
+            const response = await fetch('/api/curl-credentials', { method: 'POST' });
+            if (!response.ok) return;
+            const credentials = await response.json();
+            curlCommand.textContent = `curl -u '${credentials.username}:${credentials.password}' -F 'file=@./path/to/file' ${location.origin}/upload`;
+        }
+        copyCurlBtn.addEventListener('click', async () => {
+            await navigator.clipboard.writeText(curlCommand.textContent);
+            copyCurlBtn.textContent = 'Copied!';
+            setTimeout(() => copyCurlBtn.textContent = 'Copy command', 1500);
+        });
         // Admin panel elements
         const adminCard = document.getElementById('adminCard');
         const filesTab = document.getElementById('filesTab');
@@ -472,6 +493,7 @@
                 if (data.success) {
                     isAuthenticated = true;
                     updateUI();
+                    refreshCurlCredentials();
                     document.getElementById('username').value = '';
                     document.getElementById('password').value = '';
                 } else {

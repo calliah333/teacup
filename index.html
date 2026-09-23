@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Temporary File Sharing</title>
+    <title>Teacup</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☕</text></svg>">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -65,26 +66,28 @@
     </style>
 </head>
 <body class="min-h-screen bg-slate-50">
-    <div class="container mx-auto px-4 py-12 max-w-4xl">
-        <!-- Header Card -->
-        <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm mb-6 p-6">
-            <div class="flex items-center justify-between">
+    <div class="container mx-auto px-4 py-10 max-w-4xl">
+        <!-- Header -->
+        <header class="flex items-center justify-between mb-8">
+            <div class="flex items-center gap-3">
+                <span class="text-3xl" aria-hidden="true">☕</span>
                 <div>
-                    <h1 class="text-3xl font-bold tracking-tight mb-2">Teacup</h1>
+                    <h1 class="text-2xl font-bold tracking-tight">Teacup</h1>
+                    <p class="text-sm text-muted-foreground">Temporary file sharing</p>
                 </div>
-                <button 
-                    id="logoutBtn"
-                    class="hidden bg-secondary text-secondary-foreground hover:bg-secondary/80 font-medium py-2 px-4 rounded-md transition-colors"
-                >
-                    Logout
-                </button>
             </div>
-        </div>
+            <button 
+                id="logoutBtn"
+                class="hidden bg-card border border-border text-foreground hover:bg-accent font-medium py-2 px-4 rounded-md text-sm shadow-sm transition-colors"
+            >
+                Logout
+            </button>
+        </header>
 
         <!-- Login Card -->
-        <div id="loginCard" class="bg-card text-card-foreground rounded-lg border border-border shadow-sm mb-6 p-6">
-            <h2 class="text-2xl font-semibold mb-4">Login Required</h2>
-            <p class="text-muted-foreground mb-6">Please login to upload files</p>
+        <div id="loginCard" class="bg-card text-card-foreground rounded-lg border border-border shadow-sm mb-6 p-6 max-w-md mx-auto">
+            <h2 class="text-xl font-semibold mb-1">Sign in</h2>
+            <p class="text-sm text-muted-foreground mb-6">Sign in to upload files and shorten links</p>
             <form id="loginForm" class="space-y-4">
                 <div>
                     <label for="username" class="block text-sm font-medium mb-2">Username</label>
@@ -129,21 +132,20 @@
                 <!-- Drop Zone -->
                 <div 
                     id="dropZone" 
-                    class="border-2 border-dashed border-input rounded-lg p-12 text-center cursor-pointer transition-colors hover:border-primary hover:bg-accent/50 mb-4"
+                    class="border-2 border-dashed border-input rounded-lg p-10 text-center cursor-pointer transition-colors hover:border-primary hover:bg-accent/50 mb-4 focus:outline-none"
                 >
-                    <div class="flex flex-col items-center justify-center space-y-4">
-                        <svg class="w-12 h-12 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
-                        </svg>
+                    <div class="flex flex-col items-center justify-center space-y-3">
+                        <div class="rounded-full bg-primary/10 p-3">
+                            <svg class="w-8 h-8 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
+                            </svg>
+                        </div>
                         <div class="text-center">
                             <p class="text-sm font-medium text-foreground mb-1">
-                                Drag and drop files here, or click to select
+                                Drop files here, click to browse, or paste
                             </p>
                             <p class="text-xs text-muted-foreground">
-                                Max <span id="maxFileSizeDisplay">100</span> MB per file
-                            </p>
-                            <p class="text-xs text-muted-foreground mt-2">
-                                You can also paste files
+                                Up to <span id="maxFileSizeDisplay">100</span> MB per file, <span id="maxFilesDisplay">20</span> files at a time
                             </p>
                         </div>
                     </div>
@@ -152,35 +154,34 @@
                 <div id="fileSizeError" class="hidden bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4 text-sm mb-4"></div>
 
                 <!-- Expiration Options -->
-                <div class="bg-secondary/30 border border-border rounded-lg p-4 mb-4 space-y-3">
-                    <div id="permanentRow" class="flex items-center space-x-2">
-                        <input id="permanent" type="checkbox" class="h-4 w-4">
-                        <label for="permanent" class="text-sm">Permanent</label>
+                <div class="flex flex-wrap items-center gap-x-4 gap-y-3 text-sm">
+                    <div id="ttlControls" class="flex flex-wrap items-center gap-2 transition-opacity">
+                        <label for="ttlValue" class="text-muted-foreground">Expires after</label>
+                        <input id="ttlValue" type="number" min="1" value="3" class="w-20 px-3 py-1.5 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+                        <select id="ttlUnit" aria-label="Time unit" class="px-3 py-1.5 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring">
+                            <option value="minutes">Minutes</option>
+                            <option value="hours" selected>Hours</option>
+                            <option value="days">Days</option>
+                        </select>
+                        <span id="maxTtlHint" class="hidden text-xs text-muted-foreground"></span>
                     </div>
-                    <div id="ttlControls" class="grid grid-cols-2 gap-2">
-                        <div>
-                            <label for="ttlValue" class="block text-xs text-muted-foreground mb-1">Time value</label>
-                            <input id="ttlValue" type="number" min="1" value="3" class="w-full px-3 py-2 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2" />
-                        </div>
-                        <div>
-                            <label for="ttlUnit" class="block text-xs text-muted-foreground mb-1">Time unit</label>
-                            <select id="ttlUnit" class="w-full px-3 py-2 border border-input rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2">
-                                <option value="minutes">Minutes</option>
-                                <option value="hours" selected>Hours</option>
-                                <option value="days">Days</option>
-                            </select>
-                        </div>
+                    <div id="permanentRow" class="flex items-center gap-2 sm:ml-auto">
+                        <input id="permanent" type="checkbox" class="h-4 w-4 accent-blue-600">
+                        <label for="permanent">Keep forever</label>
                     </div>
                 </div>
             </form>
         </div>
+
+        <!-- Upload Results -->
+        <div id="results" class="space-y-4 mb-6 empty:hidden"></div>
 
         <div id="curlCard" class="bg-card text-card-foreground rounded-lg border border-border shadow-sm mb-6 p-6 hidden">
             <div class="flex items-center justify-between gap-3 mb-2">
                 <h3 class="text-sm font-semibold">Upload with curl</h3>
                 <button id="copyCurlBtn" type="button" class="text-xs px-3 py-1.5 border border-input rounded-md hover:bg-accent transition-colors">Copy command</button>
             </div>
-            <pre class="text-xs text-muted-foreground whitespace-pre-wrap break-all"><code id="curlCommand"></code></pre>
+            <pre class="text-xs text-muted-foreground bg-secondary/50 border border-border rounded-md p-3 whitespace-pre-wrap break-all"><code id="curlCommand"></code></pre>
         </div>
 
         <!-- URL Shortener Card -->
@@ -230,6 +231,7 @@
                     </svg>
                 </button>
             </form>
+            <div id="shortenResult" class="mt-4 empty:hidden"></div>
         </div>
 
         <!-- Admin Panel Card -->
@@ -266,11 +268,11 @@
                     </button>
                 </div>
                 <div id="filesContainer" class="border border-border rounded-lg overflow-hidden">
-                    <div class="bg-secondary/50 px-4 py-3 text-sm font-semibold grid grid-cols-12 gap-4">
-                        <div class="col-span-3">Filename</div>
-                        <div class="col-span-2">Uploaded</div>
-                        <div class="col-span-2">Status</div>
-                        <div class="col-span-3">Actions</div>
+                    <div class="bg-secondary/50 px-4 py-3 text-sm font-semibold grid grid-cols-12 gap-2 sm:gap-4">
+                        <div class="col-span-4">Filename</div>
+                        <div class="hidden sm:block col-span-3">Uploaded</div>
+                        <div class="col-span-4 sm:col-span-3">Status</div>
+                        <div class="col-span-4 sm:col-span-2 text-right">Actions</div>
                     </div>
                     <div id="filesList" class="divide-y divide-border">
                         <div class="px-4 py-8 text-center text-muted-foreground text-sm">Loading files...</div>
@@ -290,11 +292,11 @@
                     </button>
                 </div>
                 <div id="urlsContainer" class="border border-border rounded-lg overflow-hidden">
-                    <div class="bg-secondary/50 px-4 py-3 text-sm font-semibold grid grid-cols-12 gap-4">
-                        <div class="col-span-2">Short Code</div>
-                        <div class="col-span-5">Original URL</div>
-                        <div class="col-span-3">Created</div>
-                        <div class="col-span-2">Action</div>
+                    <div class="bg-secondary/50 px-4 py-3 text-sm font-semibold grid grid-cols-12 gap-2 sm:gap-4">
+                        <div class="col-span-3">Short Code</div>
+                        <div class="col-span-6 sm:col-span-4">Original URL</div>
+                        <div class="hidden sm:block col-span-3">Created</div>
+                        <div class="col-span-3 sm:col-span-2 text-right">Actions</div>
                     </div>
                     <div id="urlsList" class="divide-y divide-border">
                         <div class="px-4 py-8 text-center text-muted-foreground text-sm">Loading URLs...</div>
@@ -342,8 +344,7 @@
             </div>
         </div>
 
-        <!-- Results Section -->
-        <div id="results" class="space-y-4 mb-6"></div>
+    </div>
 
     <script>
         const dropZone = document.getElementById('dropZone');
@@ -401,6 +402,42 @@
         const urlsCount = document.getElementById('urlsCount');
         const refreshFilesBtn = document.getElementById('refreshFilesBtn');
         const refreshUrlsBtn = document.getElementById('refreshUrlsBtn');
+        const shortenResult = document.getElementById('shortenResult');
+
+        const COPY_ICON = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+        const CHECK_ICON = `<svg class="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>`;
+        const VIEW_ICON = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>`;
+        const TRASH_ICON = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>`;
+        const ICON_BUTTON = 'p-1.5 rounded text-muted-foreground hover:text-foreground hover:bg-accent transition-colors';
+        const DELETE_BUTTON = 'p-1.5 rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors';
+        let adminFiles = [];
+
+        function copyButton(text) {
+            return `<button type="button" data-copy="${escapeHtml(text)}" class="${ICON_BUTTON}" title="Copy link" aria-label="Copy link">${COPY_ICON}</button>`;
+        }
+
+        // Any element with data-copy copies its value and briefly shows a check mark
+        document.addEventListener('click', async (e) => {
+            const btn = e.target.closest('[data-copy]');
+            if (!btn) return;
+            try {
+                await navigator.clipboard.writeText(btn.dataset.copy);
+            } catch (err) {
+                console.error('Failed to copy to clipboard:', err);
+                return;
+            }
+            btn.innerHTML = CHECK_ICON;
+            setTimeout(() => { btn.innerHTML = COPY_ICON; }, 1200);
+        });
+
+        function formatDuration(seconds) {
+            const days = Math.floor(seconds / 86400);
+            const hours = Math.floor((seconds % 86400) / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+            if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+            return `${Math.max(minutes, 1)}m`;
+        }
 
         // File viewer modal elements
         const fileViewerModal = document.getElementById('fileViewerModal');
@@ -435,6 +472,12 @@
                 MAX_FILE_SIZE = data.maxFileSizeBytes;
                 MAX_FILES_PER_REQUEST = data.maxFilesPerRequest;
                 document.getElementById('maxFileSizeDisplay').textContent = data.maxFileSizeBytes / (1 << 20);
+                document.getElementById('maxFilesDisplay').textContent = data.maxFilesPerRequest;
+                if (data.maxTtlSeconds) {
+                    const maxTtlHint = document.getElementById('maxTtlHint');
+                    maxTtlHint.textContent = `(max ${formatDuration(data.maxTtlSeconds)})`;
+                    maxTtlHint.classList.remove('hidden');
+                }
                 setTtlInput(data.defaultTtlSeconds);
                 if (!data.permanentAllowed) {
                     permanentInput.checked = false;
@@ -470,6 +513,7 @@
                 // Load admin data when authenticated
                 loadFiles();
                 loadURLs();
+                refreshCurlCredentials();
             } else {
                 loginCard.classList.remove('hidden');
                 uploadCard.classList.add('hidden');
@@ -478,6 +522,7 @@
                 adminCard.classList.add('hidden');
                 logoutBtn.classList.add('hidden');
                 results.innerHTML = '';
+                shortenResult.innerHTML = '';
             }
         }
 
@@ -519,7 +564,6 @@
                 if (data.success) {
                     isAuthenticated = true;
                     updateUI();
-                    refreshCurlCredentials();
                     document.getElementById('username').value = '';
                     document.getElementById('password').value = '';
                 } else {
@@ -806,62 +850,38 @@
                         
                         // Show uploaded files
                         if (data.files && data.files.length > 0) {
-                            html += `
-                                <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6 mb-4">
-                                    <h3 class="text-lg font-semibold mb-4 flex items-center">
-                                        <svg class="w-5 h-5 mr-2 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                        </svg>
-                                        Upload Successful!
-                                    </h3>
-                                    <div class="space-y-3">
-                            `;
-                            
-                            const urlsToCopy = [];
-                            data.files.forEach(file => {
-                                const url = window.location.origin + '/' + file.hash + (file.extension || '');
-                                urlsToCopy.push(url);
-                                html += `
-                                    <div class="bg-accent rounded-md p-4 border border-border">
-                                        <div class="flex items-start justify-between">
-                                            <div class="flex-1 min-w-0">
-                                                <p class="text-sm font-medium text-foreground mb-1 truncate">${escapeHtml(file.filename)}</p>
-                                                <div class="flex items-center space-x-2">
-                                                    <a 
-                                                        href="${url}" 
-                                                        target="_blank" 
-                                                        rel="noopener noreferrer"
-                                                        class="text-sm text-primary hover:underline font-mono break-all"
-                                                    >
-                                                        ${url}
-                                                    </a>
-                                                    <button 
-                                                        onclick="navigator.clipboard.writeText('${url}')"
-                                                        class="ml-2 p-1 hover:bg-background rounded transition-colors"
-                                                        title="Copy link"
-                                                    >
-                                                        <svg class="w-4 h-4 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
-                                                        </svg>
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-                                `;
-                            });
-                            
+                            const urls = data.files.map(file => window.location.origin + '/' + file.hash + (file.extension || ''));
+
                             // Auto-copy first URL to clipboard
-                            if (urlsToCopy.length > 0) {
-                                navigator.clipboard.writeText(urlsToCopy[0]).catch(err => {
-                                    console.error('Failed to copy to clipboard:', err);
-                                });
-                            }
-                            
+                            navigator.clipboard.writeText(urls[0]).catch(err => {
+                                console.error('Failed to copy to clipboard:', err);
+                            });
+
                             html += `
+                                <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6">
+                                    <div class="flex items-center justify-between gap-3 mb-4">
+                                        <h3 class="text-lg font-semibold flex items-center">
+                                            <svg class="w-5 h-5 mr-2 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                            </svg>
+                                            Uploaded ${data.files.length === 1 ? '' : `${data.files.length} files`}
+                                        </h3>
+                                        <span class="text-xs text-muted-foreground">${data.files.length === 1 ? 'Link' : 'First link'} copied to clipboard</span>
+                                    </div>
+                                    <div class="space-y-2">
+                                        ${data.files.map((file, i) => `
+                                            <div class="bg-accent rounded-md px-4 py-3 border border-border flex items-center gap-3">
+                                                <div class="flex-1 min-w-0">
+                                                    <p class="text-sm font-medium text-foreground truncate">${escapeHtml(file.filename)}</p>
+                                                    <a href="${escapeHtml(urls[i])}" target="_blank" rel="noopener noreferrer" class="text-sm text-primary hover:underline font-mono break-all">${escapeHtml(urls[i])}</a>
+                                                </div>
+                                                ${copyButton(urls[i])}
+                                            </div>
+                                        `).join('')}
                                     </div>
                                 </div>
                             `;
+                            loadFiles();
                         }
                         
                         // Show errors if any
@@ -981,43 +1001,17 @@
                 const data = await response.json();
                 
                 if (data.success) {
-                    // Display success with short URL
-                    results.innerHTML = `
-                        <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm p-6 mb-4">
-                            <h3 class="text-lg font-semibold mb-4 flex items-center">
-                                <svg class="w-5 h-5 mr-2 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                </svg>
-                                URL Shortened Successfully!
-                            </h3>
-                            <div class="bg-accent rounded-md p-4 border border-border">
-                                <div class="flex items-start justify-between">
-                                    <div class="flex-1 min-w-0">
-                                        <p class="text-sm font-medium text-foreground mb-1">Original URL</p>
-                                        <p class="text-xs text-muted-foreground mb-3 break-all">${escapeHtml(data.original_url)}</p>
-                                        <p class="text-sm font-medium text-foreground mb-1">Short URL</p>
-                                        <div class="flex items-center space-x-2">
-                                            <a 
-                                                href="${escapeHtml(data.short_url)}" 
-                                                target="_blank" 
-                                                rel="noopener noreferrer"
-                                                class="text-sm text-primary hover:underline font-mono break-all"
-                                            >
-                                                ${escapeHtml(data.short_url)}
-                                            </a>
-                                            <button 
-                                                onclick="navigator.clipboard.writeText('${escapeHtml(data.short_url)}')"
-                                                class="ml-2 p-1 hover:bg-background rounded transition-colors"
-                                                title="Copy link"
-                                            >
-                                                <svg class="w-4 h-4 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
-                                                </svg>
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
+                    // Display the short URL inside the shortener card
+                    shortenResult.innerHTML = `
+                        <div class="bg-accent rounded-md px-4 py-3 border border-border flex items-center gap-3">
+                            <svg class="w-5 h-5 text-green-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            <div class="flex-1 min-w-0">
+                                <a href="${escapeHtml(data.short_url)}" target="_blank" rel="noopener noreferrer" class="text-sm text-primary hover:underline font-mono break-all">${escapeHtml(data.short_url)}</a>
+                                <p class="text-xs text-muted-foreground truncate" title="${escapeHtml(data.original_url)}">→ ${escapeHtml(data.original_url)}</p>
                             </div>
+                            ${copyButton(data.short_url)}
                         </div>
                     `;
                     
@@ -1029,6 +1023,7 @@
                     // Clear form
                     urlInput.value = '';
                     customCodeInput.value = '';
+                    loadURLs();
                 } else {
                     urlError.textContent = data.error || 'Failed to shorten URL';
                     urlError.classList.remove('hidden');
@@ -1044,10 +1039,16 @@
             }
         });
 
+        // Escapes text for HTML content and quoted attribute values
         function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
+            return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+
+        // Download path of a stored file: /<hash><extension of the stored file>
+        function fileURL(file) {
+            const name = file.file_path.split('/').pop();
+            const dot = name.lastIndexOf('.');
+            return '/' + file.hash + (dot >= 0 ? name.substring(dot) : '');
         }
 
         // Admin Panel Functions
@@ -1074,54 +1075,40 @@
                     return;
                 }
 
-                let html = '';
-                files.forEach(file => {
-                    const uploadDate = new Date(file.upload_time);
-                    const uploadTime = uploadDate.toLocaleDateString() + ' ' + uploadDate.toLocaleTimeString();
+                adminFiles = files;
+                filesList.innerHTML = files.map((file, index) => {
+                    const uploaded = new Date(file.upload_time).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
                     let status = 'Permanent';
-                    
-                    if (!file.permanent && file.remaining_ttl !== undefined) {
+                    let badge = 'bg-blue-100 text-blue-900';
+                    if (!file.permanent) {
                         if (file.remaining_ttl > 0) {
-                            const hours = Math.floor(file.remaining_ttl / 3600);
-                            const minutes = Math.floor((file.remaining_ttl % 3600) / 60);
-                            status = `Expires in ${hours}h ${minutes}m`;
+                            status = `${formatDuration(file.remaining_ttl)} left`;
+                            badge = 'bg-amber-100 text-amber-900';
                         } else {
                             status = 'Expired';
+                            badge = 'bg-slate-100 text-slate-600';
                         }
                     }
 
-                    html += `
-                        <div class="px-4 py-3 grid grid-cols-12 gap-4 items-center hover:bg-accent/50 transition-colors">
-                            <div class="col-span-3 text-sm truncate" title="${escapeHtml(file.filename)}">
+                    return `
+                        <div class="px-4 py-2.5 grid grid-cols-12 gap-2 sm:gap-4 items-center hover:bg-accent/50 transition-colors">
+                            <div class="col-span-4 text-sm truncate" title="${escapeHtml(file.filename)}">
                                 ${escapeHtml(file.filename)}
                             </div>
-                            <div class="col-span-2 text-sm text-muted-foreground">
-                                ${uploadTime}
+                            <div class="hidden sm:block col-span-3 text-sm text-muted-foreground">
+                                ${uploaded}
                             </div>
-                            <div class="col-span-2 text-sm">
-                                <span class="inline-block px-2 py-1 rounded text-xs font-medium ${file.permanent ? 'bg-blue-100 text-blue-900' : 'bg-yellow-100 text-yellow-900'}">
-                                    ${status}
-                                </span>
+                            <div class="col-span-4 sm:col-span-3 text-sm">
+                                <span class="inline-block whitespace-nowrap px-2 py-0.5 rounded-full text-xs font-medium ${badge}">${status}</span>
                             </div>
-                            <div class="col-span-3 text-sm space-x-1 flex">
-                                <button 
-                                    onclick="viewFile('${file.hash}', '${file.filename.replace(/'/g, "\\'")}')"
-                                    class="bg-primary text-primary-foreground hover:bg-primary/90 px-2 py-1 rounded text-xs font-medium transition-colors"
-                                >
-                                    View
-                                </button>
-                                <button 
-                                    onclick="deleteFile('${file.hash}')"
-                                    class="bg-destructive text-destructive-foreground hover:bg-destructive/90 px-2 py-1 rounded text-xs font-medium transition-colors"
-                                >
-                                    Delete
-                                </button>
+                            <div class="col-span-4 sm:col-span-2 flex justify-end gap-0.5">
+                                <button type="button" data-action="view" data-index="${index}" class="${ICON_BUTTON}" title="Preview" aria-label="Preview">${VIEW_ICON}</button>
+                                ${copyButton(window.location.origin + fileURL(file))}
+                                <button type="button" data-action="delete" data-index="${index}" class="${DELETE_BUTTON}" title="Delete" aria-label="Delete">${TRASH_ICON}</button>
                             </div>
                         </div>
                     `;
-                });
-
-                filesList.innerHTML = html;
+                }).join('');
             } catch (err) {
                 console.error('Error loading files:', err);
                 filesList.innerHTML = `<div class="px-4 py-8 text-center text-destructive text-sm">Error loading files</div>`;
@@ -1151,36 +1138,28 @@
                     return;
                 }
 
-                let html = '';
-                urls.forEach(url => {
-                    const createdDate = new Date(url.created_time);
-                    const createdTime = createdDate.toLocaleDateString() + ' ' + createdDate.toLocaleTimeString();
+                urlsList.innerHTML = urls.map(url => {
+                    const created = new Date(url.created_time).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
                     const shortLink = `${window.location.origin}/s/${url.short_code}`;
 
-                    html += `
-                        <div class="px-4 py-3 grid grid-cols-12 gap-4 items-center hover:bg-accent/50 transition-colors">
-                            <div class="col-span-2 text-sm font-mono text-primary">
+                    return `
+                        <div class="px-4 py-2.5 grid grid-cols-12 gap-2 sm:gap-4 items-center hover:bg-accent/50 transition-colors">
+                            <div class="col-span-3 text-sm font-mono text-primary truncate" title="${escapeHtml(url.short_code)}">
                                 ${escapeHtml(url.short_code)}
                             </div>
-                            <div class="col-span-5 text-sm text-muted-foreground truncate" title="${escapeHtml(url.original_url)}">
+                            <div class="col-span-6 sm:col-span-4 text-sm text-muted-foreground truncate" title="${escapeHtml(url.original_url)}">
                                 ${escapeHtml(url.original_url)}
                             </div>
-                            <div class="col-span-3 text-sm text-muted-foreground">
-                                ${createdTime}
+                            <div class="hidden sm:block col-span-3 text-sm text-muted-foreground">
+                                ${created}
                             </div>
-                            <div class="col-span-2 text-sm">
-                                <button 
-                                    onclick="deleteURL('${url.short_code}')"
-                                    class="bg-destructive text-destructive-foreground hover:bg-destructive/90 px-2 py-1 rounded text-xs font-medium transition-colors"
-                                >
-                                    Delete
-                                </button>
+                            <div class="col-span-3 sm:col-span-2 flex justify-end gap-0.5">
+                                ${copyButton(shortLink)}
+                                <button type="button" data-action="delete" data-code="${escapeHtml(url.short_code)}" class="${DELETE_BUTTON}" title="Delete" aria-label="Delete">${TRASH_ICON}</button>
                             </div>
                         </div>
                     `;
-                });
-
-                urlsList.innerHTML = html;
+                }).join('');
             } catch (err) {
                 console.error('Error loading URLs:', err);
                 urlsList.innerHTML = `<div class="px-4 py-8 text-center text-destructive text-sm">Error loading URLs</div>`;
@@ -1193,7 +1172,7 @@
             }
 
             try {
-                const response = await fetch(`/api/files/${hash}`, {
+                const response = await fetch(`/api/files/${encodeURIComponent(hash)}`, {
                     method: 'DELETE',
                 });
 
@@ -1221,7 +1200,7 @@
             }
 
             try {
-                const response = await fetch(`/api/urls/${shortCode}`, {
+                const response = await fetch(`/api/urls/${encodeURIComponent(shortCode)}`, {
                     method: 'DELETE',
                 });
 
@@ -1243,10 +1222,11 @@
             }
         }
 
-        async function viewFile(hash, filename) {
-            // Get file extension from filename
-            const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase();
-            const fileUrl = `/${hash}${ext}`;
+        async function viewFile(file) {
+            const filename = file.filename;
+            const fileUrl = fileURL(file);
+            const dot = fileUrl.lastIndexOf('.');
+            const ext = dot >= 0 ? fileUrl.substring(dot).toLowerCase() : '';
             
             // Update modal header
             fileViewerName.textContent = filename;
@@ -1386,6 +1366,19 @@
 
         refreshFilesBtn.addEventListener('click', loadFiles);
         refreshUrlsBtn.addEventListener('click', loadURLs);
+
+        // Row actions (rows are re-rendered, so listen on the lists)
+        filesList.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action]');
+            if (!btn) return;
+            const file = adminFiles[Number(btn.dataset.index)];
+            if (btn.dataset.action === 'view') viewFile(file);
+            if (btn.dataset.action === 'delete') deleteFile(file.hash);
+        });
+        urlsList.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action="delete"]');
+            if (btn) deleteURL(btn.dataset.code);
+        });
 
         // Initialize on page load
         loadConfig();

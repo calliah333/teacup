@@ -3,28 +3,74 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
-	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"mime"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-var (
-	maxFileSize int64 = 100 << 20 // 100 MB per file (default)
+const (
+	apiVersion = 1
+
+	fileIDBytes    = 16 // 26 base32 characters
+	shortCodeBytes = 8  // 13 base32 characters
+
+	// Multipart parts above this size are spooled to temporary files.
+	multipartMemory = 32 << 20
+	// Allowance for multipart boundaries, part headers and form fields.
+	multipartOverhead = 1 << 20
+
+	downloadCSP = "sandbox; default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'"
 )
+
+// Raster image types that are safe to render inline. Everything else,
+// including SVG and HTML, is served as an attachment.
+var inlineContentTypes = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+	"image/webp": true,
+	"image/avif": true,
+}
+
+var idEncoding = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
+
+type Config struct {
+	Username           string
+	Password           string
+	Port               string
+	MaxFileSize        int64 // bytes per file
+	MaxFilesPerRequest int
+	DefaultTTL         time.Duration
+	MaxTTL             time.Duration // 0 means no maximum
+	AllowPermanent     bool
+}
+
+func defaultConfig() Config {
+	return Config{
+		Port:               ":8080",
+		MaxFileSize:        100 << 20,
+		MaxFilesPerRequest: 20,
+		DefaultTTL:         3 * time.Hour,
+		AllowPermanent:     true,
+	}
+}
 
 type FileRecord struct {
 	Hash       string    `json:"hash"`
@@ -47,12 +93,10 @@ type Server struct {
 	urlsJSON   string
 	urlsMu     sync.RWMutex
 	uploadDir  string
-	ttl        time.Duration
+	cfg        Config
 	indexTmpl  *template.Template
 	sessions   map[string]time.Time
 	sessionsMu sync.RWMutex
-	username   string
-	password   string
 	tempAuth   map[string]tempCredential
 }
 
@@ -61,18 +105,15 @@ type tempCredential struct {
 	expires  time.Time
 }
 
-func loadCredentials(configPath string) (string, string, string, int64, error) {
-	var username, password, port string
-	var maxFileSizeMB int64 = 100 // defaults
-
-	// Config file must exist
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return "", "", "", 0, fmt.Errorf("config file not found at %s", configPath)
-	}
+func loadConfig(configPath string) (Config, error) {
+	cfg := defaultConfig()
 
 	file, err := os.Open(configPath)
+	if os.IsNotExist(err) {
+		return Config{}, fmt.Errorf("config file not found at %s", configPath)
+	}
 	if err != nil {
-		return "", "", "", 0, fmt.Errorf("failed to open config file: %w", err)
+		return Config{}, fmt.Errorf("failed to open config file: %w", err)
 	}
 	defer file.Close()
 
@@ -92,47 +133,78 @@ func loadCredentials(configPath string) (string, string, string, int64, error) {
 
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
+		if value == "" {
+			continue
+		}
 
+		var parseErr error
 		switch strings.ToLower(key) {
 		case "username":
-			username = value
+			cfg.Username = value
 		case "password":
-			password = value
+			cfg.Password = value
 		case "port":
-			port = value
+			cfg.Port = value
 		case "max_file_size_mb":
-			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
-				maxFileSizeMB = v
-			}
+			var mb int
+			mb, parseErr = parsePositiveInt(value, 1<<20) // up to 1 TB
+			cfg.MaxFileSize = int64(mb) << 20
+		case "max_files_per_request":
+			cfg.MaxFilesPerRequest, parseErr = parsePositiveInt(value, 10000)
+		case "default_ttl_hours":
+			cfg.DefaultTTL, parseErr = parseHours(value)
+		case "max_ttl_hours":
+			cfg.MaxTTL, parseErr = parseHours(value)
+		case "allow_permanent":
+			cfg.AllowPermanent, parseErr = strconv.ParseBool(value)
+		}
+		if parseErr != nil {
+			return Config{}, fmt.Errorf("invalid value %q for %s", value, key)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return "", "", "", 0, fmt.Errorf("error reading config file: %w", err)
+		return Config{}, fmt.Errorf("error reading config file: %w", err)
 	}
 
-	if username == "" {
-		return "", "", "", 0, fmt.Errorf("username not found in config file")
+	if cfg.Username == "" {
+		return Config{}, fmt.Errorf("username not found in config file")
 	}
 
-	if password == "" {
-		return "", "", "", 0, fmt.Errorf("password not found in config file")
+	if cfg.Password == "" {
+		return Config{}, fmt.Errorf("password not found in config file")
 	}
 
-	// Default port if not specified
-	if port == "" {
-		port = "8080"
+	if cfg.MaxTTL > 0 && cfg.DefaultTTL > cfg.MaxTTL {
+		return Config{}, fmt.Errorf("DEFAULT_TTL_HOURS exceeds MAX_TTL_HOURS")
 	}
 
 	// Normalize port format (ensure it starts with ":")
-	if !strings.HasPrefix(port, ":") {
-		port = ":" + port
+	if !strings.HasPrefix(cfg.Port, ":") {
+		cfg.Port = ":" + cfg.Port
 	}
 
-	return username, password, port, maxFileSizeMB, nil
+	return cfg, nil
 }
 
-func NewServer(uploadDir string, ttl time.Duration, username, password string) (*Server, error) {
+func parsePositiveInt(value string, max int) (int, error) {
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 || n > max {
+		return 0, fmt.Errorf("out of range")
+	}
+	return n, nil
+}
+
+func parseHours(value string) (time.Duration, error) {
+	hours, err := strconv.ParseFloat(value, 64)
+	// The upper bound (about 114 years) keeps the duration from overflowing.
+	if err != nil || !(hours > 0 && hours <= 1e6) {
+		return 0, fmt.Errorf("out of range")
+	}
+	return time.Duration(hours * float64(time.Hour)), nil
+}
+
+func NewServer(uploadDir string, cfg Config) (*Server, error) {
 	tmpl, err := template.ParseFiles("index.html")
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse index.html: %w", err)
@@ -141,15 +213,16 @@ func NewServer(uploadDir string, ttl time.Duration, username, password string) (
 	filesJSON := filepath.Join(uploadDir, "files.json")
 	urlsJSON := filepath.Join(uploadDir, "urls.json")
 
+	cfg.Username = strings.TrimSpace(cfg.Username)
+	cfg.Password = strings.TrimSpace(cfg.Password)
+
 	server := &Server{
 		filesJSON: filesJSON,
 		urlsJSON:  urlsJSON,
 		uploadDir: uploadDir,
-		ttl:       ttl,
+		cfg:       cfg,
 		indexTmpl: tmpl,
 		sessions:  make(map[string]time.Time),
-		username:  strings.TrimSpace(username),
-		password:  strings.TrimSpace(password),
 		tempAuth:  make(map[string]tempCredential),
 	}
 
@@ -244,6 +317,19 @@ func (s *Server) saveFilesLocked(files []FileRecord) error {
 	return os.WriteFile(s.filesJSON, data, 0644)
 }
 
+// addFileRecord appends a record under a single lock so concurrent uploads
+// can't overwrite each other's records.
+func (s *Server) addFileRecord(record FileRecord) error {
+	s.filesMu.Lock()
+	defer s.filesMu.Unlock()
+
+	files, err := s.loadFilesLocked()
+	if err != nil {
+		return err
+	}
+	return s.saveFilesLocked(append(files, record))
+}
+
 func (s *Server) loadURLs() ([]URLRecord, error) {
 	s.urlsMu.RLock()
 	defer s.urlsMu.RUnlock()
@@ -306,7 +392,7 @@ func (s *Server) loadExistingFiles() error {
 			expiresAt = file.UploadTime.Add(time.Duration(file.TTLSeconds) * time.Second)
 		} else {
 			// Backward compatibility: use server default TTL if not set
-			expiresAt = file.UploadTime.Add(s.ttl)
+			expiresAt = file.UploadTime.Add(s.cfg.DefaultTTL)
 		}
 
 		// Check if file still exists on disk
@@ -340,16 +426,33 @@ func (s *Server) loadExistingURLs() error {
 	return nil
 }
 
-func (s *Server) generateHash(filename string) string {
-	data := fmt.Sprintf("%s-%d", filename, time.Now().UnixNano())
-	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:])[:8]
+// randomID returns numBytes of crypto/rand output as lowercase unpadded base32.
+func randomID(numBytes int) string {
+	b := make([]byte, numBytes)
+	rand.Read(b) // Never fails since Go 1.24; it crashes the program instead.
+	return idEncoding.EncodeToString(b)
 }
 
-func (s *Server) generateShortCode() string {
-	data := fmt.Sprintf("%d", time.Now().UnixNano())
-	hash := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(hash[:])[:6]
+func (s *Server) newFileID() (string, error) {
+	files, err := s.loadFiles()
+	if err != nil {
+		return "", err
+	}
+	for {
+		id := randomID(fileIDBytes)
+		if !slices.ContainsFunc(files, func(f FileRecord) bool { return f.Hash == id }) {
+			return id, nil
+		}
+	}
+}
+
+func shortCodeTaken(urls []URLRecord, code string) bool {
+	return slices.ContainsFunc(urls, func(u URLRecord) bool { return u.ShortCode == code })
+}
+
+// equal compares secrets in constant time.
+func equal(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func (s *Server) generateSessionToken() (string, error) {
@@ -409,28 +512,35 @@ func (s *Server) getSessionToken(r *http.Request) string {
 
 func (s *Server) requireAuth(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		sessionToken := s.getSessionToken(r)
-		if !s.isValidSession(sessionToken) {
-			username, password, ok := r.BasicAuth()
-			tempOK := false
-			if ok {
-				s.sessionsMu.RLock()
-				credential, exists := s.tempAuth[username]
-				s.sessionsMu.RUnlock()
-				tempOK = exists && credential.password == password && credential.expires.After(time.Now())
-			}
-			if !ok || (!tempOK && (username != s.username || password != s.password)) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"success": false,
-					"error":   "Authentication required",
-				})
-				return
-			}
+		if !s.isValidSession(s.getSessionToken(r)) && !s.validBasicAuth(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "Authentication required",
+			})
+			return
 		}
 		fn(w, r)
 	}
+}
+
+func (s *Server) validBasicAuth(r *http.Request) bool {
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	// Evaluate both comparisons so timing doesn't reveal a correct username.
+	userOK := equal(username, s.cfg.Username)
+	passOK := equal(password, s.cfg.Password)
+	if userOK && passOK {
+		return true
+	}
+
+	s.sessionsMu.RLock()
+	credential, exists := s.tempAuth[username]
+	s.sessionsMu.RUnlock()
+	return exists && equal(password, credential.password) && credential.expires.After(time.Now())
 }
 
 func (s *Server) curlCredentialsHandler(w http.ResponseWriter, r *http.Request) {
@@ -449,6 +559,7 @@ func (s *Server) curlCredentialsHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	username = "temp-" + username[:12]
+	password = password[:32]
 	expires := time.Now().Add(5 * time.Minute)
 	s.sessionsMu.Lock()
 	s.tempAuth[username] = tempCredential{password: password, expires: expires}
@@ -473,7 +584,10 @@ func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if creds.Username != s.username || creds.Password != s.password {
+	// Evaluate both comparisons so timing doesn't reveal a correct username.
+	userOK := equal(creds.Username, s.cfg.Username)
+	passOK := equal(creds.Password, s.cfg.Password)
+	if !userOK || !passOK {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -533,10 +647,28 @@ func (s *Server) checkAuthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) configHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) capabilitiesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var maxTTLSeconds *int64 // null means no maximum
+	if s.cfg.MaxTTL > 0 {
+		secs := int64(s.cfg.MaxTTL / time.Second)
+		maxTTLSeconds = &secs
+	}
+
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "max-age=60")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"maxFileSizeBytes": maxFileSize,
+		"apiVersion":         apiVersion,
+		"maxFileSizeBytes":   s.cfg.MaxFileSize,
+		"maxFilesPerRequest": s.cfg.MaxFilesPerRequest,
+		"defaultTtlSeconds":  int64(s.cfg.DefaultTTL / time.Second),
+		"maxTtlSeconds":      maxTTLSeconds,
+		"permanentAllowed":   s.cfg.AllowPermanent,
+		"uploadFields":       []string{"file", "files"},
 	})
 }
 
@@ -887,30 +1019,21 @@ func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Check if custom code is already taken
-		for _, existingURL := range urls {
-			if existingURL.ShortCode == customCode {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusConflict)
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"success": false,
-					"error":   "Custom code is already taken",
-				})
-				return
-			}
+		if shortCodeTaken(urls, customCode) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "Custom code is already taken",
+			})
+			return
 		}
 
 		shortCode = customCode
 	} else {
-		// Generate short code
-		shortCode = s.generateShortCode()
-
-		// Check for collisions (very unlikely but handle it)
-		for _, existingURL := range urls {
-			if existingURL.ShortCode == shortCode {
-				// Regenerate if collision
-				shortCode = s.generateShortCode()
-				break
-			}
+		shortCode = randomID(shortCodeBytes)
+		for shortCodeTaken(urls, shortCode) {
+			shortCode = randomID(shortCodeBytes)
 		}
 	}
 
@@ -1027,25 +1150,41 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Allow larger request bodies
-	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize*10)
-
-	// Set max memory for parsing form
-	r.ParseMultipartForm(maxFileSize * 10)
-
-	var files []*multipart.FileHeader
-	if r.MultipartForm != nil {
-		files = r.MultipartForm.File["files"]
-		if len(files) == 0 {
-			files = r.MultipartForm.File["file"]
+	maxBody := s.cfg.MaxFileSize*int64(s.cfg.MaxFilesPerRequest) + multipartOverhead
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
+		status, message := http.StatusBadRequest, "Invalid multipart form"
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+			message = fmt.Sprintf("Request exceeds maximum size of %d MB", maxBody>>20)
 		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   message,
+		})
+		return
 	}
+	defer r.MultipartForm.RemoveAll()
+
+	files := slices.Concat(r.MultipartForm.File["files"], r.MultipartForm.File["file"])
 	if len(files) == 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
 			"error":   "No files uploaded",
+		})
+		return
+	}
+	if len(files) > s.cfg.MaxFilesPerRequest {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Too many files: %d (maximum %d per request)", len(files), s.cfg.MaxFilesPerRequest),
 		})
 		return
 	}
@@ -1062,8 +1201,13 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		Error    string `json:"error"`
 	}
 
-	var uploadedFiles []UploadedFile
+	uploadedFiles := []UploadedFile{}
 	var uploadErrors []UploadError
+	storageFailed := false
+	storageError := func(filename, message string) {
+		storageFailed = true
+		uploadErrors = append(uploadErrors, UploadError{Filename: filename, Error: message})
+	}
 
 	// Parse optional TTL and permanence from form
 	permanent := false
@@ -1074,19 +1218,30 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 			permanent = true
 		}
 	}
+	if permanent && !s.cfg.AllowPermanent {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Permanent files are not allowed",
+		})
+		return
+	}
 	var perFileTTL time.Duration
 	if !permanent {
+		// Fall back to the server default when missing or invalid
+		perFileTTL = s.cfg.DefaultTTL
 		if ttlStr := r.FormValue("ttl_seconds"); ttlStr != "" {
-			if secs, err := strconv.ParseInt(ttlStr, 10, 64); err == nil && secs > 0 {
+			if secs, err := strconv.ParseInt(ttlStr, 10, 64); err == nil && secs > 0 && secs <= math.MaxInt64/int64(time.Second) {
 				perFileTTL = time.Duration(secs) * time.Second
 			}
 		}
-		// If not provided or invalid, fallback to server default
-		if perFileTTL <= 0 {
-			perFileTTL = s.ttl
+		if s.cfg.MaxTTL > 0 && perFileTTL > s.cfg.MaxTTL {
+			perFileTTL = s.cfg.MaxTTL
 		}
 	}
 
+	maxFileSize := s.cfg.MaxFileSize
 	for _, fileHeader := range files {
 		// Check file size before processing
 		if fileHeader.Size > maxFileSize {
@@ -1100,14 +1255,17 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		file, err := fileHeader.Open()
 		if err != nil {
 			log.Printf("Error opening file: %v", err)
-			uploadErrors = append(uploadErrors, UploadError{
-				Filename: fileHeader.Filename,
-				Error:    "Failed to open file",
-			})
+			storageError(fileHeader.Filename, "Failed to open file")
 			continue
 		}
 
-		hash := s.generateHash(fileHeader.Filename)
+		hash, err := s.newFileID()
+		if err != nil {
+			file.Close()
+			log.Printf("Error loading files: %v", err)
+			storageError(fileHeader.Filename, "Failed to store file")
+			continue
+		}
 		ext := filepath.Ext(fileHeader.Filename)
 		filePath := filepath.Join(s.uploadDir, hash+ext)
 
@@ -1115,10 +1273,7 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			file.Close()
 			log.Printf("Error creating file: %v", err)
-			uploadErrors = append(uploadErrors, UploadError{
-				Filename: fileHeader.Filename,
-				Error:    "Failed to create file",
-			})
+			storageError(fileHeader.Filename, "Failed to create file")
 			continue
 		}
 
@@ -1131,10 +1286,7 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			os.Remove(filePath)
 			log.Printf("Error saving file: %v", err)
-			uploadErrors = append(uploadErrors, UploadError{
-				Filename: fileHeader.Filename,
-				Error:    "Failed to save file",
-			})
+			storageError(fileHeader.Filename, "Failed to save file")
 			continue
 		}
 
@@ -1148,34 +1300,20 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		uploadTime := time.Now()
-
 		// Store file info in JSON
 		fileRecord := FileRecord{
 			Hash:       hash,
 			Filename:   fileHeader.Filename,
-			UploadTime: uploadTime,
+			UploadTime: time.Now(),
 			FilePath:   filePath,
-			TTLSeconds: func() int64 {
-				if permanent {
-					return 0
-				}
-				return int64(perFileTTL.Seconds())
-			}(),
-			Permanent: permanent,
+			TTLSeconds: int64(perFileTTL / time.Second),
+			Permanent:  permanent,
 		}
 
-		files, err := s.loadFiles()
-		if err != nil {
-			os.Remove(filePath)
-			log.Printf("Error loading files: %v", err)
-			continue
-		}
-
-		files = append(files, fileRecord)
-		if err := s.saveFiles(files); err != nil {
+		if err := s.addFileRecord(fileRecord); err != nil {
 			os.Remove(filePath)
 			log.Printf("Error storing file info: %v", err)
+			storageError(fileHeader.Filename, "Failed to store file")
 			continue
 		}
 
@@ -1192,17 +1330,24 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Uploaded file. Written to:  %v", filePath)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-
+	status := http.StatusOK
 	response := map[string]interface{}{
-		"success": true,
+		"success": len(uploadedFiles) > 0,
 		"files":   uploadedFiles,
 	}
-
+	if len(uploadedFiles) == 0 {
+		status = http.StatusBadRequest
+		if storageFailed {
+			status = http.StatusInternalServerError
+		}
+		response["error"] = "No files were uploaded"
+	}
 	if len(uploadErrors) > 0 {
 		response["errors"] = uploadErrors
 	}
 
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(response)
 }
 
@@ -1273,17 +1418,24 @@ func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	w.Header().Set("Content-Type", contentType)
+	mediaType, _, _ := mime.ParseMediaType(contentType)
 
-	// Check if file is an image - images should be rendered inline, not downloaded
-	isImage := strings.HasPrefix(contentType, "image/")
-	if isImage {
-		// For images, serve inline so they render in the browser
-		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename))
-	} else {
-		// For other files, force download
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	// Only raster images render inline; anything that could run script
+	// (SVG, HTML, ...) is downloaded, and the CSP sandbox disables script
+	// even if a browser renders it anyway.
+	disposition := "attachment"
+	if inlineContentTypes[mediaType] {
+		disposition = "inline"
 	}
+	if v := mime.FormatMediaType(disposition, map[string]string{"filename": filename}); v != "" {
+		disposition = v
+	}
+
+	h := w.Header()
+	h.Set("Content-Type", contentType)
+	h.Set("Content-Disposition", disposition)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Security-Policy", downloadCSP)
 
 	http.ServeFile(w, r, filePath)
 }
@@ -1423,7 +1575,7 @@ func (s *Server) cleanupRoutine() {
 			if file.TTLSeconds > 0 {
 				expiresAt = file.UploadTime.Add(time.Duration(file.TTLSeconds) * time.Second)
 			} else {
-				expiresAt = file.UploadTime.Add(s.ttl)
+				expiresAt = file.UploadTime.Add(s.cfg.DefaultTTL)
 			}
 			if !expiresAt.IsZero() && expiresAt.Before(now) {
 				// File has expired, delete it
@@ -1442,20 +1594,31 @@ func (s *Server) cleanupRoutine() {
 	}
 }
 
-func main() {
-	// Load credentials from config file
-	configPath := ".env"
+func (s *Server) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.indexHandler)
+	mux.HandleFunc("/upload", s.requireAuth(s.uploadHandler))
+	mux.HandleFunc("/api/curl-credentials", s.requireAuth(s.curlCredentialsHandler))
+	mux.HandleFunc("/shorten", s.requireAuth(s.shortenHandler))
+	mux.HandleFunc("/login", s.loginHandler)
+	mux.HandleFunc("/logout", s.logoutHandler)
+	mux.HandleFunc("/check-auth", s.checkAuthHandler)
+	mux.HandleFunc("/api/capabilities", s.capabilitiesHandler)
+	mux.HandleFunc("/api/files", s.requireAuth(s.listFilesHandler))
+	mux.HandleFunc("/api/urls", s.requireAuth(s.listURLsHandler))
+	mux.HandleFunc("/api/files/", s.requireAuth(s.deleteFileHandler))
+	mux.HandleFunc("/api/urls/", s.requireAuth(s.deleteURLHandler))
+	return mux
+}
 
-	username, password, port, fileSizeMB, err := loadCredentials(configPath)
+func main() {
+	cfg, err := loadConfig(".env")
 	if err != nil {
-		log.Fatal("Failed to load credentials:", err)
+		log.Fatal("Failed to load config: ", err)
 	}
 
-	// Set global variables from config
-	maxFileSize = fileSizeMB << 20
-
-	log.Printf("Loaded credentials: USERNAME=%s, PASSWORD=%s, PORT=%s", username, password, port)
-	log.Printf("File size limit: %d MB", maxFileSize/(1<<20))
+	log.Printf("Loaded config: USERNAME=%s, PORT=%s", cfg.Username, cfg.Port)
+	log.Printf("File size limit: %d MB, max %d files per request", cfg.MaxFileSize>>20, cfg.MaxFilesPerRequest)
 
 	uploadDir := "./uploads"
 	if uploadEnv := os.Getenv("UPLOAD_DIR"); uploadEnv != "" {
@@ -1465,29 +1628,14 @@ func main() {
 		log.Fatal("Failed to create upload directory:", err)
 	}
 
-	ttl := 3 * time.Hour
-
-	server, err := NewServer(uploadDir, ttl, username, password)
+	server, err := NewServer(uploadDir, cfg)
 	if err != nil {
 		log.Fatal("Failed to create server:", err)
 	}
 
 	go server.cleanupRoutine()
 
-	http.HandleFunc("/", server.indexHandler)
-	http.HandleFunc("/upload", server.requireAuth(server.uploadHandler))
-	http.HandleFunc("/api/curl-credentials", server.requireAuth(server.curlCredentialsHandler))
-	http.HandleFunc("/shorten", server.requireAuth(server.shortenHandler))
-	http.HandleFunc("/login", server.loginHandler)
-	http.HandleFunc("/logout", server.logoutHandler)
-	http.HandleFunc("/check-auth", server.checkAuthHandler)
-	http.HandleFunc("/config", server.configHandler)
-	http.HandleFunc("/api/files", server.requireAuth(server.listFilesHandler))
-	http.HandleFunc("/api/urls", server.requireAuth(server.listURLsHandler))
-	http.HandleFunc("/api/files/", server.requireAuth(server.deleteFileHandler))
-	http.HandleFunc("/api/urls/", server.requireAuth(server.deleteURLHandler))
-
-	log.Printf("Server starting on %s", port)
-	log.Printf("Files will expire after %v", ttl)
-	log.Fatal(http.ListenAndServe(port, nil))
+	log.Printf("Server starting on %s", cfg.Port)
+	log.Printf("Files expire after %v by default", cfg.DefaultTTL)
+	log.Fatal(http.ListenAndServe(cfg.Port, server.routes()))
 }

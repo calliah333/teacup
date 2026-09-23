@@ -153,7 +153,7 @@
 
                 <!-- Expiration Options -->
                 <div class="bg-secondary/30 border border-border rounded-lg p-4 mb-4 space-y-3">
-                    <div class="flex items-center space-x-2">
+                    <div id="permanentRow" class="flex items-center space-x-2">
                         <input id="permanent" type="checkbox" class="h-4 w-4">
                         <label for="permanent" class="text-sm">Permanent</label>
                     </div>
@@ -175,7 +175,7 @@
             </form>
         </div>
 
-        <div class="bg-card text-card-foreground rounded-lg border border-border shadow-sm mb-6 p-6">
+        <div id="curlCard" class="bg-card text-card-foreground rounded-lg border border-border shadow-sm mb-6 p-6 hidden">
             <div class="flex items-center justify-between gap-3 mb-2">
                 <h3 class="text-sm font-semibold">Upload with curl</h3>
                 <button id="copyCurlBtn" type="button" class="text-xs px-3 py-1.5 border border-input rounded-md hover:bg-accent transition-colors">Copy command</button>
@@ -372,18 +372,20 @@
         const shortenIcon = document.getElementById('shortenIcon');
         const shortenSpinner = document.getElementById('shortenSpinner');
         const urlError = document.getElementById('urlError');
+        const curlCard = document.getElementById('curlCard');
         const curlCommand = document.getElementById('curlCommand');
         const copyCurlBtn = document.getElementById('copyCurlBtn');
-
-        curlCommand.textContent = `curl -u username:password -F 'file=@./path/to/file' ${location.origin}/upload`;
+        let curlCommandValue = `curl -u username:password -F 'file=@./path/to/file' ${location.origin}/upload`;
+        curlCommand.textContent = `curl -u '********:********' -F 'file=@./path/to/file' ${location.origin}/upload`;
         async function refreshCurlCredentials() {
             const response = await fetch('/api/curl-credentials', { method: 'POST' });
             if (!response.ok) return;
             const credentials = await response.json();
-            curlCommand.textContent = `curl -u '${credentials.username}:${credentials.password}' -F 'file=@./path/to/file' ${location.origin}/upload`;
+            curlCommandValue = `curl -u '${credentials.username}:${credentials.password}' -F 'file=@./path/to/file' ${location.origin}/upload`;
+            curlCommand.textContent = `curl -u '********:********' -F 'file=@./path/to/file' ${location.origin}/upload`;
         }
         copyCurlBtn.addEventListener('click', async () => {
-            await navigator.clipboard.writeText(curlCommand.textContent);
+            await navigator.clipboard.writeText(curlCommandValue);
             copyCurlBtn.textContent = 'Copied!';
             setTimeout(() => copyCurlBtn.textContent = 'Copy command', 1500);
         });
@@ -407,16 +409,37 @@
         const fileViewerDownloadLink = document.getElementById('fileViewerDownloadLink');
 
         let MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB in bytes (default)
+        let MAX_FILES_PER_REQUEST = 20;
 
         let isAuthenticated = false;
 
-        // Fetch server configuration including max file size
+        // Set the expiry input to a duration in seconds, using the largest whole unit
+        function setTtlInput(seconds) {
+            if (seconds % 86400 === 0) {
+                ttlValueInput.value = seconds / 86400;
+                ttlUnitSelect.value = 'days';
+            } else if (seconds % 3600 === 0) {
+                ttlValueInput.value = seconds / 3600;
+                ttlUnitSelect.value = 'hours';
+            } else {
+                ttlValueInput.value = Math.max(1, Math.round(seconds / 60));
+                ttlUnitSelect.value = 'minutes';
+            }
+        }
+
+        // Fetch server limits and defaults
         async function loadConfig() {
             try {
-                const response = await fetch('/config');
+                const response = await fetch('/api/capabilities');
                 const data = await response.json();
                 MAX_FILE_SIZE = data.maxFileSizeBytes;
+                MAX_FILES_PER_REQUEST = data.maxFilesPerRequest;
                 document.getElementById('maxFileSizeDisplay').textContent = data.maxFileSizeBytes / (1 << 20);
+                setTtlInput(data.defaultTtlSeconds);
+                if (!data.permanentAllowed) {
+                    permanentInput.checked = false;
+                    document.getElementById('permanentRow').classList.add('hidden');
+                }
             } catch (err) {
                 console.error('Error loading config:', err);
             }
@@ -440,6 +463,7 @@
             if (isAuthenticated) {
                 loginCard.classList.add('hidden');
                 uploadCard.classList.remove('hidden');
+                curlCard.classList.remove('hidden');
                 urlShortenerCard.classList.remove('hidden');
                 adminCard.classList.remove('hidden');
                 logoutBtn.classList.remove('hidden');
@@ -449,6 +473,7 @@
             } else {
                 loginCard.classList.remove('hidden');
                 uploadCard.classList.add('hidden');
+                curlCard.classList.add('hidden');
                 urlShortenerCard.classList.add('hidden');
                 adminCard.classList.add('hidden');
                 logoutBtn.classList.add('hidden');
@@ -627,9 +652,12 @@
             }
         });
 
-        // File size validation
+        // File count and size validation
         function validateFiles(files) {
             const errors = [];
+            if (files.length > MAX_FILES_PER_REQUEST) {
+                errors.push(`${files.length} files selected (max ${MAX_FILES_PER_REQUEST} per upload)`);
+            }
             for (let file of files) {
                 if (file.size > MAX_FILE_SIZE) {
                     const sizeMB = (file.size / (1024 * 1024)).toFixed(2);
@@ -649,7 +677,7 @@
             const sizeErrors = validateFiles(fileInput.files);
             if (sizeErrors.length > 0) {
                 fileSizeError.innerHTML = `
-                    <p class="font-medium mb-2">File size limit exceeded:</p>
+                    <p class="font-medium mb-2">Upload limit exceeded:</p>
                     <ul class="list-disc list-inside space-y-1">
                         ${sizeErrors.map(err => `<li>${escapeHtml(err)}</li>`).join('')}
                     </ul>
@@ -758,18 +786,6 @@
                         return;
                     }
                     
-                    // Handle other HTTP errors
-                    if (xhr.status < 200 || xhr.status >= 300) {
-                        results.innerHTML = `
-                            <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
-                                <p class="font-medium">Upload failed</p>
-                                <p class="text-sm mt-1">Server error (${xhr.status})</p>
-                            </div>
-                        `;
-                        fileInput.value = '';
-                        return;
-                    }
-                    
                     let data;
                     try {
                         data = JSON.parse(xhr.responseText);
@@ -777,14 +793,15 @@
                         results.innerHTML = `
                             <div class="bg-destructive/10 border-destructive/50 text-destructive rounded-lg border p-4">
                                 <p class="font-medium">Upload failed</p>
-                                <p class="text-sm mt-1">Failed to parse server response</p>
+                                <p class="text-sm mt-1">${xhr.status >= 200 && xhr.status < 300 ? 'Failed to parse server response' : `Server error (${xhr.status})`}</p>
                             </div>
                         `;
                         fileInput.value = '';
                         return;
                     }
                     
-                    if (data.success) {
+                    // Failed uploads still list per-file errors
+                    if (data.success || (data.errors && data.errors.length > 0)) {
                         let html = '';
                         
                         // Show uploaded files

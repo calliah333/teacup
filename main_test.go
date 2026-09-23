@@ -199,7 +199,7 @@ func TestRandomIDs(t *testing.T) {
 		bytes int
 		re    *regexp.Regexp
 	}{
-		{fileIDBytes, regexp.MustCompile(`^[a-z2-7]{26}$`)},
+		{fileIDBytes, regexp.MustCompile(`^[a-z2-7]{13}$`)},
 		{shortCodeBytes, regexp.MustCompile(`^[a-z2-7]{13}$`)},
 	}
 	for _, tc := range tests {

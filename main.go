@@ -28,8 +28,8 @@ import (
 const (
 	apiVersion = 1
 
-	fileIDBytes    = 16 // 26 base32 characters
-	shortCodeBytes = 8  // 13 base32 characters
+	fileIDBytes    = 8 // 13 base32 characters
+	shortCodeBytes = 8 // 13 base32 characters
 
 	// Multipart parts above this size are spooled to temporary files.
 	multipartMemory = 32 << 20

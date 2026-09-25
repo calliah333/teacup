@@ -14,6 +14,7 @@ import (
 	"log"
 	"math"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,6 +55,7 @@ var idEncoding = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadd
 type Config struct {
 	Username           string
 	Password           string
+	APIKey             string // accepted in the x-api-key header; empty disables it
 	Port               string
 	MaxFileSize        int64 // bytes per file
 	MaxFilesPerRequest int
@@ -143,6 +145,8 @@ func loadConfig(configPath string) (Config, error) {
 			cfg.Username = value
 		case "password":
 			cfg.Password = value
+		case "api_key":
+			cfg.APIKey = value
 		case "port":
 			cfg.Port = value
 		case "max_file_size_mb":
@@ -510,12 +514,16 @@ func (s *Server) getSessionToken(r *http.Request) string {
 	return cookie.Value
 }
 
+// authorized reports whether r carries a session cookie, HTTP Basic Auth
+// credentials or the configured API key.
+func (s *Server) authorized(r *http.Request) bool {
+	return s.isValidSession(s.getSessionToken(r)) || s.validBasicAuth(r) || s.validAPIKey(r)
+}
+
 func (s *Server) requireAuth(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.isValidSession(s.getSessionToken(r)) && !s.validBasicAuth(r) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]interface{}{
+		if !s.authorized(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"success": false,
 				"error":   "Authentication required",
 			})
@@ -523,6 +531,12 @@ func (s *Server) requireAuth(fn http.HandlerFunc) http.HandlerFunc {
 		}
 		fn(w, r)
 	}
+}
+
+// validAPIKey checks the chibisafe-style x-api-key header. API keys are
+// disabled when API_KEY is unset.
+func (s *Server) validAPIKey(r *http.Request) bool {
+	return s.cfg.APIKey != "" && equal(r.Header.Get("X-Api-Key"), s.cfg.APIKey)
 }
 
 func (s *Server) validBasicAuth(r *http.Request) bool {
@@ -1144,194 +1158,188 @@ func absoluteURL(r *http.Request, path string) string {
 	return scheme + "://" + r.Host + path
 }
 
+// uploadFailure is an upload error and the HTTP status it maps to.
+type uploadFailure struct {
+	status  int
+	message string
+}
+
+type uploadedFile struct {
+	Hash      string `json:"hash"`
+	Filename  string `json:"filename"`
+	Extension string `json:"extension"`
+	URL       string `json:"url"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+// parseUploadForm caps the body at maxFiles full-size files and parses it.
+// On success the caller must call r.MultipartForm.RemoveAll.
+func (s *Server) parseUploadForm(w http.ResponseWriter, r *http.Request, maxFiles int) *uploadFailure {
+	maxBody := s.cfg.MaxFileSize*int64(maxFiles) + multipartOverhead
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return &uploadFailure{http.StatusRequestEntityTooLarge, fmt.Sprintf("Request exceeds maximum size of %d MB", maxBody>>20)}
+		}
+		return &uploadFailure{http.StatusBadRequest, "Invalid multipart form"}
+	}
+	return nil
+}
+
+// uploadOptions reads the optional permanent and ttl_seconds form fields.
+// The TTL is zero for permanent uploads.
+func (s *Server) uploadOptions(r *http.Request) (time.Duration, bool, *uploadFailure) {
+	permanent := false
+	switch strings.ToLower(r.FormValue("permanent")) {
+	case "true", "1", "on", "yes":
+		permanent = true
+	}
+	if permanent {
+		if !s.cfg.AllowPermanent {
+			return 0, false, &uploadFailure{http.StatusBadRequest, "Permanent files are not allowed"}
+		}
+		return 0, true, nil
+	}
+	// Fall back to the server default when missing or invalid
+	ttl := s.cfg.DefaultTTL
+	if ttlStr := r.FormValue("ttl_seconds"); ttlStr != "" {
+		if secs, err := strconv.ParseInt(ttlStr, 10, 64); err == nil && secs > 0 && secs <= math.MaxInt64/int64(time.Second) {
+			ttl = time.Duration(secs) * time.Second
+		}
+	}
+	if s.cfg.MaxTTL > 0 && ttl > s.cfg.MaxTTL {
+		ttl = s.cfg.MaxTTL
+	}
+	return ttl, false, nil
+}
+
+// storeFile saves one uploaded part, records it and schedules its expiry.
+// Failures are 413 when the file is too large and 500 when storage fails.
+func (s *Server) storeFile(r *http.Request, fileHeader *multipart.FileHeader, ttl time.Duration, permanent bool) (uploadedFile, *uploadFailure) {
+	maxFileSize := s.cfg.MaxFileSize
+	tooLarge := &uploadFailure{http.StatusRequestEntityTooLarge, fmt.Sprintf("File size exceeds maximum allowed size of %d MB", maxFileSize>>20)}
+	// Check file size before processing
+	if fileHeader.Size > maxFileSize {
+		tooLarge.message = fmt.Sprintf("File size (%d MB) exceeds maximum allowed size of %d MB", fileHeader.Size>>20, maxFileSize>>20)
+		return uploadedFile{}, tooLarge
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		log.Printf("Error opening file: %v", err)
+		return uploadedFile{}, &uploadFailure{http.StatusInternalServerError, "Failed to open file"}
+	}
+	defer file.Close()
+
+	hash, err := s.newFileID()
+	if err != nil {
+		log.Printf("Error loading files: %v", err)
+		return uploadedFile{}, &uploadFailure{http.StatusInternalServerError, "Failed to store file"}
+	}
+	ext := filepath.Ext(fileHeader.Filename)
+	filePath := filepath.Join(s.uploadDir, hash+ext)
+
+	dst, err := os.Create(filePath)
+	if err != nil {
+		log.Printf("Error creating file: %v", err)
+		return uploadedFile{}, &uploadFailure{http.StatusInternalServerError, "Failed to create file"}
+	}
+
+	// Use LimitedReader to enforce size limit during copy
+	n, err := io.Copy(dst, io.LimitReader(file, maxFileSize+1))
+	dst.Close()
+	if err != nil {
+		os.Remove(filePath)
+		log.Printf("Error saving file: %v", err)
+		return uploadedFile{}, &uploadFailure{http.StatusInternalServerError, "Failed to save file"}
+	}
+	// Check if file exceeded limit during copy
+	if n > maxFileSize {
+		os.Remove(filePath)
+		return uploadedFile{}, tooLarge
+	}
+
+	fileRecord := FileRecord{
+		Hash:       hash,
+		Filename:   fileHeader.Filename,
+		UploadTime: time.Now(),
+		FilePath:   filePath,
+		TTLSeconds: int64(ttl / time.Second),
+		Permanent:  permanent,
+	}
+	if err := s.addFileRecord(fileRecord); err != nil {
+		os.Remove(filePath)
+		log.Printf("Error storing file info: %v", err)
+		return uploadedFile{}, &uploadFailure{http.StatusInternalServerError, "Failed to store file"}
+	}
+
+	if !permanent {
+		go s.scheduleDelete(hash, ttl)
+	}
+	log.Printf("Uploaded file. Written to:  %v", filePath)
+	return uploadedFile{
+		Hash:      hash,
+		Filename:  fileHeader.Filename,
+		Extension: ext,
+		URL:       absoluteURL(r, "/"+hash+ext),
+	}, nil
+}
+
 func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	fail := func(f *uploadFailure) {
+		writeJSON(w, f.status, map[string]any{"success": false, "error": f.message})
+	}
 
-	maxBody := s.cfg.MaxFileSize*int64(s.cfg.MaxFilesPerRequest) + multipartOverhead
-	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
-	if err := r.ParseMultipartForm(multipartMemory); err != nil {
-		status, message := http.StatusBadRequest, "Invalid multipart form"
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			status = http.StatusRequestEntityTooLarge
-			message = fmt.Sprintf("Request exceeds maximum size of %d MB", maxBody>>20)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   message,
-		})
+	if f := s.parseUploadForm(w, r, s.cfg.MaxFilesPerRequest); f != nil {
+		fail(f)
 		return
 	}
 	defer r.MultipartForm.RemoveAll()
 
 	files := slices.Concat(r.MultipartForm.File["files"], r.MultipartForm.File["file"])
 	if len(files) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "No files uploaded",
-		})
+		fail(&uploadFailure{http.StatusBadRequest, "No files uploaded"})
 		return
 	}
 	if len(files) > s.cfg.MaxFilesPerRequest {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   fmt.Sprintf("Too many files: %d (maximum %d per request)", len(files), s.cfg.MaxFilesPerRequest),
-		})
+		fail(&uploadFailure{http.StatusBadRequest, fmt.Sprintf("Too many files: %d (maximum %d per request)", len(files), s.cfg.MaxFilesPerRequest)})
 		return
 	}
-
-	type UploadedFile struct {
-		Hash      string `json:"hash"`
-		Filename  string `json:"filename"`
-		Extension string `json:"extension"`
-		URL       string `json:"url"`
+	ttl, permanent, f := s.uploadOptions(r)
+	if f != nil {
+		fail(f)
+		return
 	}
 
 	type UploadError struct {
 		Filename string `json:"filename"`
 		Error    string `json:"error"`
 	}
-
-	uploadedFiles := []UploadedFile{}
+	uploadedFiles := []uploadedFile{}
 	var uploadErrors []UploadError
 	storageFailed := false
-	storageError := func(filename, message string) {
-		storageFailed = true
-		uploadErrors = append(uploadErrors, UploadError{Filename: filename, Error: message})
-	}
-
-	// Parse optional TTL and permanence from form
-	permanent := false
-	if pv := r.FormValue("permanent"); pv != "" {
-		// Accept "true"/"1"/"on"
-		switch strings.ToLower(pv) {
-		case "true", "1", "on", "yes":
-			permanent = true
-		}
-	}
-	if permanent && !s.cfg.AllowPermanent {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Permanent files are not allowed",
-		})
-		return
-	}
-	var perFileTTL time.Duration
-	if !permanent {
-		// Fall back to the server default when missing or invalid
-		perFileTTL = s.cfg.DefaultTTL
-		if ttlStr := r.FormValue("ttl_seconds"); ttlStr != "" {
-			if secs, err := strconv.ParseInt(ttlStr, 10, 64); err == nil && secs > 0 && secs <= math.MaxInt64/int64(time.Second) {
-				perFileTTL = time.Duration(secs) * time.Second
-			}
-		}
-		if s.cfg.MaxTTL > 0 && perFileTTL > s.cfg.MaxTTL {
-			perFileTTL = s.cfg.MaxTTL
-		}
-	}
-
-	maxFileSize := s.cfg.MaxFileSize
 	for _, fileHeader := range files {
-		// Check file size before processing
-		if fileHeader.Size > maxFileSize {
-			uploadErrors = append(uploadErrors, UploadError{
-				Filename: fileHeader.Filename,
-				Error:    fmt.Sprintf("File size (%d MB) exceeds maximum allowed size of %d MB", fileHeader.Size/(1<<20), maxFileSize/(1<<20)),
-			})
+		uploaded, f := s.storeFile(r, fileHeader, ttl, permanent)
+		if f != nil {
+			storageFailed = storageFailed || f.status >= http.StatusInternalServerError
+			uploadErrors = append(uploadErrors, UploadError{Filename: fileHeader.Filename, Error: f.message})
 			continue
 		}
-
-		file, err := fileHeader.Open()
-		if err != nil {
-			log.Printf("Error opening file: %v", err)
-			storageError(fileHeader.Filename, "Failed to open file")
-			continue
-		}
-
-		hash, err := s.newFileID()
-		if err != nil {
-			file.Close()
-			log.Printf("Error loading files: %v", err)
-			storageError(fileHeader.Filename, "Failed to store file")
-			continue
-		}
-		ext := filepath.Ext(fileHeader.Filename)
-		filePath := filepath.Join(s.uploadDir, hash+ext)
-
-		dst, err := os.Create(filePath)
-		if err != nil {
-			file.Close()
-			log.Printf("Error creating file: %v", err)
-			storageError(fileHeader.Filename, "Failed to create file")
-			continue
-		}
-
-		// Use LimitedReader to enforce size limit during copy
-		limitedReader := io.LimitReader(file, maxFileSize+1)
-		n, err := io.Copy(dst, limitedReader)
-		file.Close()
-		dst.Close()
-
-		if err != nil {
-			os.Remove(filePath)
-			log.Printf("Error saving file: %v", err)
-			storageError(fileHeader.Filename, "Failed to save file")
-			continue
-		}
-
-		// Check if file exceeded limit during copy
-		if n > maxFileSize {
-			os.Remove(filePath)
-			uploadErrors = append(uploadErrors, UploadError{
-				Filename: fileHeader.Filename,
-				Error:    fmt.Sprintf("File size exceeds maximum allowed size of %d MB", maxFileSize/(1<<20)),
-			})
-			continue
-		}
-
-		// Store file info in JSON
-		fileRecord := FileRecord{
-			Hash:       hash,
-			Filename:   fileHeader.Filename,
-			UploadTime: time.Now(),
-			FilePath:   filePath,
-			TTLSeconds: int64(perFileTTL / time.Second),
-			Permanent:  permanent,
-		}
-
-		if err := s.addFileRecord(fileRecord); err != nil {
-			os.Remove(filePath)
-			log.Printf("Error storing file info: %v", err)
-			storageError(fileHeader.Filename, "Failed to store file")
-			continue
-		}
-
-		uploadedFiles = append(uploadedFiles, UploadedFile{
-			Hash:      hash,
-			Filename:  fileHeader.Filename,
-			Extension: ext,
-			URL:       absoluteURL(r, "/"+hash+ext),
-		})
-
-		if !permanent {
-			go s.scheduleDelete(hash, perFileTTL)
-		}
-		log.Printf("Uploaded file. Written to:  %v", filePath)
+		uploadedFiles = append(uploadedFiles, uploaded)
 	}
 
 	status := http.StatusOK
-	response := map[string]interface{}{
+	response := map[string]any{
 		"success": len(uploadedFiles) > 0,
 		"files":   uploadedFiles,
 	}
@@ -1345,10 +1353,67 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if len(uploadErrors) > 0 {
 		response["errors"] = uploadErrors
 	}
+	writeJSON(w, status, response)
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(response)
+// chibisafeUploadHandler implements chibisafe's POST /api/upload so clients
+// made for chibisafe (ShareX configs, browser extensions, scripts) work as-is:
+// one file per request, x-api-key auth, and chibisafe's response and error
+// shapes. Chunked uploads (chibi-* headers) are rejected rather than stored
+// as partial files.
+func (s *Server) chibisafeUploadHandler(w http.ResponseWriter, r *http.Request) {
+	fail := func(status int, message string) {
+		writeJSON(w, status, map[string]any{
+			"statusCode": status,
+			"error":      http.StatusText(status),
+			"message":    message,
+		})
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		fail(http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !s.authorized(r) {
+		fail(http.StatusUnauthorized, "Invalid authorization")
+		return
+	}
+	if r.Header.Get("chibi-uuid") != "" || r.Header.Get("chibi-chunk-number") != "" || r.Header.Get("chibi-chunks-total") != "" {
+		fail(http.StatusBadRequest, "Chunked uploads are not supported")
+		return
+	}
+
+	if f := s.parseUploadForm(w, r, 1); f != nil {
+		fail(f.status, f.message)
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+
+	// chibisafe clients send "file[]", but chibisafe accepts any field name.
+	var files []*multipart.FileHeader
+	for _, headers := range r.MultipartForm.File {
+		files = append(files, headers...)
+	}
+	if len(files) != 1 {
+		fail(http.StatusBadRequest, fmt.Sprintf("Expected exactly one file, got %d", len(files)))
+		return
+	}
+	ttl, permanent, f := s.uploadOptions(r)
+	if f != nil {
+		fail(f.status, f.message)
+		return
+	}
+	uploaded, f := s.storeFile(r, files[0], ttl, permanent)
+	if f != nil {
+		fail(f.status, f.message)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":  uploaded.Hash + uploaded.Extension,
+		"uuid":  uploaded.Hash,
+		"url":   uploaded.URL,
+		"thumb": "",
+	})
 }
 
 func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
@@ -1598,6 +1663,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.indexHandler)
 	mux.HandleFunc("/upload", s.requireAuth(s.uploadHandler))
+	mux.HandleFunc("/api/upload", s.chibisafeUploadHandler)
 	mux.HandleFunc("/api/curl-credentials", s.requireAuth(s.curlCredentialsHandler))
 	mux.HandleFunc("/shorten", s.requireAuth(s.shortenHandler))
 	mux.HandleFunc("/login", s.loginHandler)

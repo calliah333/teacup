@@ -13,6 +13,7 @@ If you are hosting this behind cloudflare, keep in mind they have a 100MB cap fo
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `USERNAME`, `PASSWORD` | required | Login and HTTP Basic Auth credentials |
+| `API_KEY` | unset (disabled) | Key accepted in the `x-api-key` header on every authenticated endpoint |
 | `PORT` | `8080` | Listen port |
 | `MAX_FILE_SIZE_MB` | `100` | Maximum size of one file |
 | `MAX_FILES_PER_REQUEST` | `20` | Maximum files in one upload request |
@@ -33,6 +34,36 @@ The JSON response includes the downloadable URL. Multiple files are supported wi
 Optional form fields: `ttl_seconds` (expiry in seconds, capped at the server maximum) and `permanent=true`.
 
 The response is `200` when at least one file was stored. Files that failed are listed in `errors` as `{filename, error}`. When every file fails the status is `400` (validation) or `500` (storage), and `413` when the request body is too large.
+
+## chibisafe-compatible uploads
+
+`POST /api/upload` accepts [chibisafe](https://github.com/chibisafe/chibisafe) upload requests, so ShareX configs, browser extensions and scripts made for chibisafe work when pointed at teacup. Set `API_KEY` and send it as `x-api-key`:
+
+```sh
+curl -H 'x-api-key: your-api-key' -F 'file[]=@./shot.png' https://your-host/api/upload
+```
+
+```json
+{"name": "c2e4jfzcc2iny.png", "uuid": "c2e4jfzcc2iny", "url": "https://your-host/c2e4jfzcc2iny.png", "thumb": ""}
+```
+
+Each request uploads exactly one file. Errors use chibisafe's shape: `{"statusCode": 413, "error": "Request Entity Too Large", "message": "..."}`. Uploads use the default expiry, and the optional `ttl_seconds` and `permanent` fields also work here. The `albumuuid` header is ignored. Chunked uploads (`chibi-*` headers) are rejected with `400`.
+
+A ShareX custom uploader (`.sxcu`) for teacup:
+
+```json
+{
+  "Version": "14.0.0",
+  "Name": "teacup",
+  "DestinationType": "ImageUploader, FileUploader",
+  "RequestMethod": "POST",
+  "RequestURL": "https://your-host/api/upload",
+  "Headers": { "x-api-key": "your-api-key" },
+  "Body": "MultipartFormData",
+  "FileFormName": "file[]",
+  "URL": "{json:url}"
+}
+```
 
 ## Capabilities
 

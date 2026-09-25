@@ -350,3 +350,75 @@ func TestUploadBodyTooLarge(t *testing.T) {
 		t.Errorf("status %d, %+v", code, resp)
 	}
 }
+
+func TestChibisafeUpload(t *testing.T) {
+	cfg := testConfig()
+	cfg.APIKey = "key"
+	cfg.MaxFileSize = 1 << 10
+	s := newTestServer(t, cfg)
+
+	type chibiResponse struct {
+		StatusCode      int
+		Name, UUID, URL string
+		Error, Message  string
+	}
+	post := func(apiKey string, headers map[string]string, files ...testFile) (int, chibiResponse) {
+		t.Helper()
+		body, contentType := multipartBody(t, nil, files...)
+		req := httptest.NewRequest(http.MethodPost, "/api/upload", body)
+		req.Header.Set("Content-Type", contentType)
+		if apiKey != "" {
+			req.Header.Set("x-api-key", apiKey)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		s.routes().ServeHTTP(rec, req)
+		var resp chibiResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decoding response %q: %v", rec.Body.String(), err)
+		}
+		return rec.Code, resp
+	}
+	shot := testFile{field: "file[]", name: "shot.png", content: "png"}
+
+	code, resp := post("key", nil, shot)
+	if code != http.StatusOK || resp.Name != resp.UUID+".png" || resp.URL != "http://example.com/"+resp.Name {
+		t.Fatalf("upload: status %d, %+v", code, resp)
+	}
+	dl := httptest.NewRecorder()
+	s.routes().ServeHTTP(dl, httptest.NewRequest(http.MethodGet, "/"+resp.Name, nil))
+	if dl.Code != http.StatusOK || dl.Body.String() != "png" {
+		t.Errorf("download: status %d, body %q", dl.Code, dl.Body.String())
+	}
+
+	failures := []struct {
+		name    string
+		apiKey  string
+		headers map[string]string
+		files   []testFile
+		status  int
+	}{
+		{"wrong key", "nope", nil, []testFile{shot}, http.StatusUnauthorized},
+		{"no key", "", nil, []testFile{shot}, http.StatusUnauthorized},
+		{"chunked", "key", map[string]string{"chibi-uuid": "u", "chibi-chunk-number": "0", "chibi-chunks-total": "2"}, []testFile{shot}, http.StatusBadRequest},
+		{"two files", "key", nil, []testFile{shot, shot}, http.StatusBadRequest},
+		{"oversized", "key", nil, []testFile{{field: "file[]", name: "big.bin", content: strings.Repeat("x", 2<<10)}}, http.StatusRequestEntityTooLarge},
+	}
+	for _, tc := range failures {
+		code, resp := post(tc.apiKey, tc.headers, tc.files...)
+		if code != tc.status || resp.StatusCode != tc.status || resp.Error != http.StatusText(tc.status) || resp.Message == "" {
+			t.Errorf("%s: status %d, %+v", tc.name, code, resp)
+		}
+	}
+	if files, _ := s.loadFiles(); len(files) != 1 {
+		t.Errorf("rejected uploads stored records: %+v", files)
+	}
+
+	// Without API_KEY configured, x-api-key never authenticates.
+	s.cfg.APIKey = ""
+	if code, _ := post("", map[string]string{"x-api-key": ""}, shot); code != http.StatusUnauthorized {
+		t.Errorf("empty configured key: status %d", code)
+	}
+}

@@ -1,0 +1,6 @@
+# Allowlist: only what the build needs enters the context, so secrets
+# (.env), uploads and local tool state never reach an image layer.
+*
+!go.mod
+!*.go
+!index.html

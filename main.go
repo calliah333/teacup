@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"math"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,6 +41,8 @@ const (
 
 	// Multipart parts above this size are spooled to temporary files.
 	multipartMemory = 32 << 20
+	// Cap on JSON request bodies (login, shorten).
+	maxJSONBody = 64 << 10
 	// Allowance for multipart boundaries, part headers and form fields.
 	multipartOverhead = 1 << 20
 
@@ -376,10 +380,64 @@ func (s *Server) loadURLsLocked() ([]URLRecord, error) {
 	return urls, nil
 }
 
-func (s *Server) saveURLs(urls []URLRecord) error {
+// takeFile removes the record for hash under a single lock and returns it.
+// Loading and saving separately would drop records added in between.
+func (s *Server) takeFile(hash string) (FileRecord, bool, error) {
+	s.filesMu.Lock()
+	defer s.filesMu.Unlock()
+
+	files, err := s.loadFilesLocked()
+	if err != nil {
+		return FileRecord{}, false, err
+	}
+	i := slices.IndexFunc(files, func(f FileRecord) bool { return f.Hash == hash })
+	if i < 0 {
+		return FileRecord{}, false, nil
+	}
+	record := files[i]
+	return record, true, s.saveFilesLocked(slices.Delete(files, i, i+1))
+}
+
+// takeURL removes the record for shortCode under a single lock and returns it.
+func (s *Server) takeURL(shortCode string) (URLRecord, bool, error) {
 	s.urlsMu.Lock()
 	defer s.urlsMu.Unlock()
-	return s.saveURLsLocked(urls)
+
+	urls, err := s.loadURLsLocked()
+	if err != nil {
+		return URLRecord{}, false, err
+	}
+	i := slices.IndexFunc(urls, func(u URLRecord) bool { return u.ShortCode == shortCode })
+	if i < 0 {
+		return URLRecord{}, false, nil
+	}
+	record := urls[i]
+	return record, true, s.saveURLsLocked(slices.Delete(urls, i, i+1))
+}
+
+var errShortCodeTaken = errors.New("short code taken")
+
+// addURL stores a URL under customCode, or under a fresh random code when
+// customCode is empty. The taken check and the save share one lock.
+func (s *Server) addURL(originalURL, customCode string) (URLRecord, error) {
+	s.urlsMu.Lock()
+	defer s.urlsMu.Unlock()
+
+	urls, err := s.loadURLsLocked()
+	if err != nil {
+		return URLRecord{}, err
+	}
+	code := customCode
+	if code == "" {
+		code = randomID(shortCodeLength)
+		for shortCodeTaken(urls, code) {
+			code = randomID(shortCodeLength)
+		}
+	} else if shortCodeTaken(urls, code) {
+		return URLRecord{}, errShortCodeTaken
+	}
+	record := URLRecord{ShortCode: code, OriginalURL: originalURL, CreatedTime: time.Now()}
+	return record, s.saveURLsLocked(append(urls, record))
 }
 
 func (s *Server) saveURLsLocked(urls []URLRecord) error {
@@ -399,6 +457,7 @@ func (s *Server) loadExistingFiles() error {
 
 	now := time.Now()
 	var validFiles []FileRecord
+	var expiries []func()
 
 	for _, file := range files {
 		var expiresAt time.Time
@@ -420,20 +479,26 @@ func (s *Server) loadExistingFiles() error {
 		validFiles = append(validFiles, file)
 
 		// If file hasn't expired yet, schedule deletion
+		hash := file.Hash
 		if !file.Permanent && !expiresAt.IsZero() && expiresAt.After(now) {
 			remainingTTL := expiresAt.Sub(now)
-			go s.scheduleDelete(file.Hash, remainingTTL)
+			expiries = append(expiries, func() { s.scheduleDelete(hash, remainingTTL) })
 		} else if !file.Permanent && !expiresAt.IsZero() {
 			// File has expired, delete it immediately
-			go s.deleteFile(file.Hash)
+			expiries = append(expiries, func() { s.deleteFile(hash) })
 		}
 	}
 
 	// Save back the valid files (removing ones that don't exist on disk)
+	// before any deletion runs, so the save can't restore a deleted record.
 	if len(validFiles) != len(files) {
-		return s.saveFiles(validFiles)
+		if err := s.saveFiles(validFiles); err != nil {
+			return err
+		}
 	}
-
+	for _, expire := range expiries {
+		go expire()
+	}
 	return nil
 }
 
@@ -466,9 +531,11 @@ func shortCodeTaken(urls []URLRecord, code string) bool {
 	return slices.ContainsFunc(urls, func(u URLRecord) bool { return u.ShortCode == code })
 }
 
-// equal compares secrets in constant time.
+// equal compares secrets in constant time. Hashing first keeps the
+// comparison from revealing the secret's length.
 func equal(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+	ha, hb := sha256.Sum256([]byte(a)), sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
 }
 
 func (s *Server) generateSessionToken() (string, error) {
@@ -514,6 +581,11 @@ func (s *Server) cleanupSessions() {
 				delete(s.sessions, token)
 			}
 		}
+		for username, credential := range s.tempAuth {
+			if credential.expires.Before(now) {
+				delete(s.tempAuth, username)
+			}
+		}
 		s.sessionsMu.Unlock()
 	}
 }
@@ -527,14 +599,31 @@ func (s *Server) getSessionToken(r *http.Request) string {
 }
 
 // authorized reports whether r carries a session cookie, HTTP Basic Auth
-// credentials or the configured API key.
+// credentials or the configured API key. Temporary curl credentials are
+// not accepted here; see requireUploadAuth.
 func (s *Server) authorized(r *http.Request) bool {
-	return s.isValidSession(s.getSessionToken(r)) || s.validBasicAuth(r) || s.validAPIKey(r)
+	if s.isValidSession(s.getSessionToken(r)) || s.validBasicAuth(r) || s.validAPIKey(r) {
+		return true
+	}
+	s.logPresentedCredentialFailure(r)
+	return false
 }
 
 func (s *Server) requireAuth(fn http.HandlerFunc) http.HandlerFunc {
+	return s.requireAuthWith(s.authorized, fn)
+}
+
+// requireUploadAuth also accepts temporary curl credentials, which are
+// limited to uploading so a leaked one can't list, delete or mint more.
+func (s *Server) requireUploadAuth(fn http.HandlerFunc) http.HandlerFunc {
+	return s.requireAuthWith(func(r *http.Request) bool {
+		return s.validTempAuth(r) || s.authorized(r)
+	}, fn)
+}
+
+func (s *Server) requireAuthWith(ok func(*http.Request) bool, fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.authorized(r) {
+		if !ok(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{
 				"success": false,
 				"error":   "Authentication required",
@@ -542,6 +631,30 @@ func (s *Server) requireAuth(fn http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		fn(w, r)
+	}
+}
+
+// logAuthFailure writes the line fail2ban matches:
+//
+//	auth failure: remote=<ip> forwarded="<X-Forwarded-For>" method=<method>
+//
+// forwarded is client-controlled unless a trusted proxy overwrites it.
+func logAuthFailure(r *http.Request, method string) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	log.Printf("auth failure: remote=%s forwarded=%q method=%s", host, r.Header.Get("X-Forwarded-For"), method)
+}
+
+// logPresentedCredentialFailure logs failed Basic Auth or API key attempts.
+// Missing or expired session cookies are not logged: the UI makes those
+// requests routinely.
+func (s *Server) logPresentedCredentialFailure(r *http.Request) {
+	if _, _, ok := r.BasicAuth(); ok && !s.validTempAuth(r) {
+		logAuthFailure(r, "basic")
+	} else if r.Header.Get("X-Api-Key") != "" {
+		logAuthFailure(r, "api-key")
 	}
 }
 
@@ -559,10 +672,15 @@ func (s *Server) validBasicAuth(r *http.Request) bool {
 	// Evaluate both comparisons so timing doesn't reveal a correct username.
 	userOK := equal(username, s.cfg.Username)
 	passOK := equal(password, s.cfg.Password)
-	if userOK && passOK {
-		return true
-	}
+	return userOK && passOK
+}
 
+// validTempAuth checks Basic Auth against unexpired temporary curl credentials.
+func (s *Server) validTempAuth(r *http.Request) bool {
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
 	s.sessionsMu.RLock()
 	credential, exists := s.tempAuth[username]
 	s.sessionsMu.RUnlock()
@@ -605,6 +723,7 @@ func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
@@ -614,6 +733,7 @@ func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
 	userOK := equal(creds.Username, s.cfg.Username)
 	passOK := equal(creds.Password, s.cfg.Password)
 	if !userOK || !passOK {
+		logAuthFailure(r, "login")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -635,6 +755,7 @@ func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   86400, // 24 hours
 		HttpOnly: true,
+		Secure:   isHTTPS(r),
 		SameSite: http.SameSiteStrictMode,
 	})
 
@@ -656,6 +777,8 @@ func (s *Server) logoutHandler(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   isHTTPS(r),
+		SameSite: http.SameSiteStrictMode,
 	})
 
 	w.Header().Set("Content-Type", "application/json")
@@ -803,58 +926,25 @@ func (s *Server) deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find and delete the file
-	files, err := s.loadFiles()
+	record, found, err := s.takeFile(hash)
 	if err != nil {
-		log.Printf("Error loading files: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		log.Printf("Error deleting file record: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success": false,
-			"error":   "Failed to load files",
+			"error":   "Failed to delete file",
 		})
 		return
 	}
-
-	var found bool
-	var filePath, filename string
-	var updatedFiles []FileRecord
-
-	for _, file := range files {
-		if file.Hash == hash {
-			found = true
-			filePath = file.FilePath
-			filename = file.Filename
-		} else {
-			updatedFiles = append(updatedFiles, file)
-		}
-	}
-
 	if !found {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusNotFound, map[string]any{
 			"success": false,
 			"error":   "File not found",
 		})
 		return
 	}
-
-	// Delete file from disk
-	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-		log.Printf("Error deleting file %s: %v", filePath, err)
-	}
-
-	// Save updated file list
-	if err := s.saveFiles(updatedFiles); err != nil {
-		log.Printf("Error saving files: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Failed to delete file",
-		})
-		return
+	filename := record.Filename
+	if err := os.Remove(record.FilePath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Error deleting file %s: %v", record.FilePath, err)
 	}
 
 	log.Printf("Admin deleted file: %s (%s)", filename, hash)
@@ -884,53 +974,23 @@ func (s *Server) deleteURLHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find and delete the URL
-	urls, err := s.loadURLs()
+	record, found, err := s.takeURL(shortCode)
 	if err != nil {
-		log.Printf("Error loading URLs: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Failed to load URLs",
-		})
-		return
-	}
-
-	var found bool
-	var originalURL string
-	var updatedURLs []URLRecord
-
-	for _, url := range urls {
-		if url.ShortCode == shortCode {
-			found = true
-			originalURL = url.OriginalURL
-		} else {
-			updatedURLs = append(updatedURLs, url)
-		}
-	}
-
-	if !found {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "URL not found",
-		})
-		return
-	}
-
-	// Save updated URL list
-	if err := s.saveURLs(updatedURLs); err != nil {
-		log.Printf("Error saving URLs: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		log.Printf("Error deleting URL: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success": false,
 			"error":   "Failed to delete URL",
 		})
 		return
 	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"success": false,
+			"error":   "URL not found",
+		})
+		return
+	}
+	originalURL := record.OriginalURL
 
 	log.Printf("Admin deleted URL: %s (%s)", originalURL, shortCode)
 
@@ -952,6 +1012,7 @@ func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		CustomCode string `json:"custom_code,omitempty"`
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -996,23 +1057,9 @@ func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load existing URLs
-	urls, err := s.loadURLs()
-	if err != nil {
-		log.Printf("Error loading URLs: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "Internal server error",
-		})
-		return
-	}
-
-	var shortCode string
+	customCode := strings.TrimSpace(req.CustomCode)
 	if req.CustomCode != "" {
 		// Validate custom code
-		customCode := strings.TrimSpace(req.CustomCode)
 		if len(customCode) < 3 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
@@ -1043,55 +1090,27 @@ func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-
-		// Check if custom code is already taken
-		if shortCodeTaken(urls, customCode) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   "Custom code is already taken",
-			})
-			return
-		}
-
-		shortCode = customCode
-	} else {
-		shortCode = randomID(shortCodeLength)
-		for shortCodeTaken(urls, shortCode) {
-			shortCode = randomID(shortCodeLength)
-		}
 	}
 
-	createdTime := time.Now()
-
-	// Create URL record (always permanent)
-	urlRecord := URLRecord{
-		ShortCode:   shortCode,
-		OriginalURL: req.URL,
-		CreatedTime: createdTime,
+	// URLs are always permanent
+	urlRecord, err := s.addURL(req.URL, customCode)
+	if errors.Is(err, errShortCodeTaken) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"success": false,
+			"error":   "Custom code is already taken",
+		})
+		return
 	}
-
-	// Save URL
-	urls = append(urls, urlRecord)
-	if err := s.saveURLs(urls); err != nil {
+	if err != nil {
 		log.Printf("Error saving URL: %v", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"success": false,
 			"error":   "Failed to save URL",
 		})
 		return
 	}
-
-	// Return success with short URL
-	shortURL := fmt.Sprintf("%s://%s/s/%s", func() string {
-		if r.TLS != nil {
-			return "https"
-		}
-		return "http"
-	}(), r.Host, shortCode)
+	shortCode := urlRecord.ShortCode
+	shortURL := absoluteURL(r, "/s/"+shortCode)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1158,13 +1177,22 @@ func (s *Server) indexHandler(w http.ResponseWriter, r *http.Request) {
 		s.downloadHandler(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html")
+	h := w.Header()
+	h.Set("Content-Type", "text/html")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Content-Security-Policy", "frame-ancestors 'none'")
 	s.indexTmpl.Execute(w, nil)
+}
+
+// isHTTPS reports whether the client connected over HTTPS, directly or via
+// a TLS-terminating proxy that sets X-Forwarded-Proto.
+func isHTTPS(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 }
 
 func absoluteURL(r *http.Request, path string) string {
 	scheme := "http"
-	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+	if isHTTPS(r) {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host + path
@@ -1523,113 +1551,23 @@ func (s *Server) scheduleDelete(hash string, ttl time.Duration) {
 }
 
 func (s *Server) removeFile(hash string) {
-	files, err := s.loadFiles()
-	if err != nil {
-		log.Printf("Error loading files for removal: %v", err)
-		return
-	}
-
-	var updatedFiles []FileRecord
-	var filename string
-	for _, file := range files {
-		if file.Hash == hash {
-			filename = file.Filename
-			// Skip this file (remove it)
-		} else {
-			updatedFiles = append(updatedFiles, file)
-		}
-	}
-
-	// If we didn't find the file, it's already removed
-	if filename == "" {
-		return
-	}
-
-	if err := s.saveFiles(updatedFiles); err != nil {
-		log.Printf("Error saving files after removal: %v", err)
+	if _, _, err := s.takeFile(hash); err != nil {
+		log.Printf("Error removing file record %s: %v", hash, err)
 	}
 }
 
 func (s *Server) deleteFile(hash string) {
-	files, err := s.loadFiles()
+	record, found, err := s.takeFile(hash)
 	if err != nil {
-		log.Printf("Error loading files for deletion: %v", err)
-		return
+		log.Printf("Error removing file record %s: %v", hash, err)
 	}
-
-	var filename, filePath string
-	var found bool
-	for _, file := range files {
-		if file.Hash == hash {
-			filename = file.Filename
-			filePath = file.FilePath
-			found = true
-			break
-		}
-	}
-
 	if !found {
 		return // Already deleted
 	}
-
-	// Delete file from disk
-	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-		log.Printf("Error deleting file %s: %v", filePath, err)
+	if err := os.Remove(record.FilePath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Error deleting file %s: %v", record.FilePath, err)
 	}
-
-	// Delete from JSON
-	s.removeFile(hash)
-	log.Printf("Deleted expired file: %s (%s)", filename, hash)
-}
-
-func (s *Server) scheduleDeleteURL(shortCode string, ttl time.Duration) {
-	time.Sleep(ttl)
-	s.deleteURL(shortCode)
-}
-
-func (s *Server) removeURL(shortCode string) {
-	urls, err := s.loadURLs()
-	if err != nil {
-		log.Printf("Error loading URLs for removal: %v", err)
-		return
-	}
-
-	var updatedURLs []URLRecord
-	for _, url := range urls {
-		if url.ShortCode != shortCode {
-			updatedURLs = append(updatedURLs, url)
-		}
-	}
-
-	if err := s.saveURLs(updatedURLs); err != nil {
-		log.Printf("Error saving URLs after removal: %v", err)
-	}
-}
-
-func (s *Server) deleteURL(shortCode string) {
-	urls, err := s.loadURLs()
-	if err != nil {
-		log.Printf("Error loading URLs for deletion: %v", err)
-		return
-	}
-
-	var originalURL string
-	var found bool
-	for _, url := range urls {
-		if url.ShortCode == shortCode {
-			originalURL = url.OriginalURL
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return // Already deleted
-	}
-
-	// Delete from JSON
-	s.removeURL(shortCode)
-	log.Printf("Deleted expired URL: %s (%s)", originalURL, shortCode)
+	log.Printf("Deleted expired file: %s (%s)", record.Filename, hash)
 }
 
 func (s *Server) cleanupRoutine() {
@@ -1655,15 +1593,7 @@ func (s *Server) cleanupRoutine() {
 				expiresAt = file.UploadTime.Add(s.cfg.DefaultTTL)
 			}
 			if !expiresAt.IsZero() && expiresAt.Before(now) {
-				// File has expired, delete it
-				// Delete file from disk
-				if err := os.Remove(file.FilePath); err != nil && !os.IsNotExist(err) {
-					log.Printf("Error deleting expired file %s: %v", file.FilePath, err)
-				}
-
-				// Delete from JSON
-				s.removeFile(file.Hash)
-				log.Printf("Cleaned up expired file: %s (%s)", file.Filename, file.Hash)
+				s.deleteFile(file.Hash)
 			}
 		}
 
@@ -1674,7 +1604,7 @@ func (s *Server) cleanupRoutine() {
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.indexHandler)
-	mux.HandleFunc("/upload", s.requireAuth(s.uploadHandler))
+	mux.HandleFunc("/upload", s.requireUploadAuth(s.uploadHandler))
 	mux.HandleFunc("/api/upload", s.chibisafeUploadHandler)
 	mux.HandleFunc("/api/curl-credentials", s.requireAuth(s.curlCredentialsHandler))
 	mux.HandleFunc("/shorten", s.requireAuth(s.shortenHandler))
@@ -1715,5 +1645,14 @@ func main() {
 
 	log.Printf("Server starting on %s", cfg.Port)
 	log.Printf("Files expire after %v by default", cfg.DefaultTTL)
-	log.Fatal(http.ListenAndServe(cfg.Port, server.routes()))
+	srv := &http.Server{
+		Addr:    cfg.Port,
+		Handler: server.routes(),
+		// Body reads and writes are left unbounded so large uploads and
+		// downloads on slow links still finish; headers and idle
+		// connections are bounded against slowloris.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	log.Fatal(srv.ListenAndServe())
 }

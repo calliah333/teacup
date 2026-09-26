@@ -4,9 +4,31 @@
 
 Fill out the .env.example and remove the .example
 
-Dockerfile and compose are included 
+Dockerfile and compose are included. The container runs as UID 10001 and reads `.env` from a read-only mount, so it is never baked into the image. Both bind mounts must be accessible to that UID:
+
+```sh
+mkdir -p uploads && sudo chown -R 10001:10001 uploads
+chmod 644 .env   # or: sudo chown 10001 .env && chmod 600 .env
+```
+
+Upgrading from the old root-based image needs the `chown` above, since existing uploads are owned by root.
 
 If you are hosting this behind cloudflare, keep in mind they have a 100MB cap for proxied files.
+
+## Brute-force protection
+
+teacup does not rate-limit itself. Every failed login, Basic Auth or API key attempt is logged as:
+
+```
+2026/09/26 01:40:00 auth failure: remote=203.0.113.7 forwarded="" method=login
+```
+
+`remote` is the TCP peer. Behind a reverse proxy it is the proxy, so ban on the proxy's own logs or on `forwarded` (the `X-Forwarded-For` header, trustworthy only when your proxy overwrites it). A fail2ban filter for direct exposure:
+
+```ini
+[Definition]
+failregex = auth failure: remote=<HOST> forwarded=
+```
 
 ## Settings
 
@@ -31,6 +53,8 @@ curl -u username:password -F 'file=@./path/to/file' https://your-host/upload
 ```
 
 The JSON response includes the downloadable URL. Multiple files are supported with repeated `-F file=@...` arguments.
+
+The curl command shown in the web UI uses temporary credentials that expire after 5 minutes and only work on `/upload`.
 
 Optional form fields: `ttl_seconds` (expiry in seconds, capped at the server maximum) and `permanent=true`.
 

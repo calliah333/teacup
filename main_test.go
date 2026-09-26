@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -171,6 +172,20 @@ func TestBasicAuth(t *testing.T) {
 	if code := try(temp.Username, temp.Password+"x"); code != http.StatusUnauthorized {
 		t.Errorf("wrong temporary password: status %d", code)
 	}
+	// They only upload: a leaked one can't list, delete or mint more.
+	for _, target := range []struct{ method, path string }{
+		{http.MethodPost, "/api/curl-credentials"},
+		{http.MethodGet, "/api/files"},
+		{http.MethodPost, "/shorten"},
+	} {
+		req := httptest.NewRequest(target.method, target.path, nil)
+		req.SetBasicAuth(temp.Username, temp.Password)
+		rec := httptest.NewRecorder()
+		s.routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("temporary credentials on %s: status %d", target.path, rec.Code)
+		}
+	}
 	s.sessionsMu.Lock()
 	s.tempAuth[temp.Username] = tempCredential{password: temp.Password, expires: time.Now().Add(-time.Second)}
 	s.sessionsMu.Unlock()
@@ -192,6 +207,59 @@ func TestLogin(t *testing.T) {
 	}
 	if rec := login("admin", "secret"); rec.Code != http.StatusOK || len(rec.Result().Cookies()) != 1 {
 		t.Errorf("correct login: status %d, cookies %v", rec.Code, rec.Result().Cookies())
+	}
+}
+
+// Concurrent writers must not overwrite each other's records.
+func TestConcurrentURLWrites(t *testing.T) {
+	s := newTestServer(t, testConfig())
+	shorten := func(code string) int {
+		body, _ := json.Marshal(map[string]string{"url": "https://example.com/", "custom_code": code})
+		req := httptest.NewRequest(http.MethodPost, "/shorten", bytes.NewReader(body))
+		req.SetBasicAuth("admin", "secret")
+		rec := httptest.NewRecorder()
+		s.routes().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for i := range 10 {
+		if code := shorten(fmt.Sprintf("old%d", i)); code != http.StatusOK {
+			t.Fatalf("seed shorten: status %d", code)
+		}
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sameCodeOK := 0
+	for i := range 10 {
+		wg.Add(3)
+		go func() { defer wg.Done(); shorten(fmt.Sprintf("new%d", i)) }()
+		go func() {
+			defer wg.Done()
+			if shorten("same") == http.StatusOK {
+				mu.Lock()
+				sameCodeOK++
+				mu.Unlock()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/urls/old%d", i), nil)
+			req.SetBasicAuth("admin", "secret")
+			s.routes().ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	wg.Wait()
+
+	if sameCodeOK != 1 {
+		t.Errorf("same custom code stored %d times", sameCodeOK)
+	}
+	urls, _ := s.loadURLs()
+	var codes []string
+	for _, u := range urls {
+		codes = append(codes, u.ShortCode)
+	}
+	if len(urls) != 11 {
+		t.Errorf("want the 10 new codes and one \"same\", got %v", codes)
 	}
 }
 

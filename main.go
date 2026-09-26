@@ -29,8 +29,13 @@ import (
 const (
 	apiVersion = 1
 
-	fileIDBytes    = 8 // 13 base32 characters
-	shortCodeBytes = 8 // 13 base32 characters
+	defaultHashLength = 13 // base32 characters (~65 bits); override with HASH_LENGTH
+	shortCodeLength   = 13 // base32 characters
+
+	// Bounds for HASH_LENGTH. Below the minimum the ID space is small enough
+	// that collision retries could spin; 64 characters is 320 bits.
+	minHashLength = 4
+	maxHashLength = 64
 
 	// Multipart parts above this size are spooled to temporary files.
 	multipartMemory = 32 << 20
@@ -62,6 +67,7 @@ type Config struct {
 	DefaultTTL         time.Duration
 	MaxTTL             time.Duration // 0 means no maximum
 	AllowPermanent     bool
+	HashLength         int // characters in generated file IDs
 }
 
 func defaultConfig() Config {
@@ -71,6 +77,7 @@ func defaultConfig() Config {
 		MaxFilesPerRequest: 20,
 		DefaultTTL:         3 * time.Hour,
 		AllowPermanent:     true,
+		HashLength:         defaultHashLength,
 	}
 }
 
@@ -161,6 +168,11 @@ func loadConfig(configPath string) (Config, error) {
 			cfg.MaxTTL, parseErr = parseHours(value)
 		case "allow_permanent":
 			cfg.AllowPermanent, parseErr = strconv.ParseBool(value)
+		case "hash_length":
+			cfg.HashLength, parseErr = parsePositiveInt(value, maxHashLength)
+			if parseErr == nil && cfg.HashLength < minHashLength {
+				parseErr = fmt.Errorf("out of range")
+			}
 		}
 		if parseErr != nil {
 			return Config{}, fmt.Errorf("invalid value %q for %s", value, key)
@@ -430,11 +442,11 @@ func (s *Server) loadExistingURLs() error {
 	return nil
 }
 
-// randomID returns numBytes of crypto/rand output as lowercase unpadded base32.
-func randomID(numBytes int) string {
-	b := make([]byte, numBytes)
+// randomID returns length characters of lowercase unpadded base32 drawn from crypto/rand.
+func randomID(length int) string {
+	b := make([]byte, (length*5+7)/8)
 	rand.Read(b) // Never fails since Go 1.24; it crashes the program instead.
-	return idEncoding.EncodeToString(b)
+	return idEncoding.EncodeToString(b)[:length]
 }
 
 func (s *Server) newFileID() (string, error) {
@@ -443,7 +455,7 @@ func (s *Server) newFileID() (string, error) {
 		return "", err
 	}
 	for {
-		id := randomID(fileIDBytes)
+		id := randomID(s.cfg.HashLength)
 		if !slices.ContainsFunc(files, func(f FileRecord) bool { return f.Hash == id }) {
 			return id, nil
 		}
@@ -1045,9 +1057,9 @@ func (s *Server) shortenHandler(w http.ResponseWriter, r *http.Request) {
 
 		shortCode = customCode
 	} else {
-		shortCode = randomID(shortCodeBytes)
+		shortCode = randomID(shortCodeLength)
 		for shortCodeTaken(urls, shortCode) {
-			shortCode = randomID(shortCodeBytes)
+			shortCode = randomID(shortCodeLength)
 		}
 	}
 

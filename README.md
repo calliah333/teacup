@@ -20,6 +20,7 @@ If you are hosting this behind cloudflare, keep in mind they have a 100MB cap fo
 | `DEFAULT_TTL_HOURS` | `3` | Expiry used when an upload doesn't set one |
 | `MAX_TTL_HOURS` | unset (no maximum) | Longer requested expiries are capped to this |
 | `ALLOW_PERMANENT` | `true` | Whether uploads may be marked permanent |
+| `HASH_LENGTH` | `13` | Characters in generated file IDs (4–64, lowercase base32). Existing files keep their IDs |
 
 ## Upload with curl
 

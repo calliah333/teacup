@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -195,21 +196,16 @@ func TestLogin(t *testing.T) {
 }
 
 func TestRandomIDs(t *testing.T) {
-	tests := []struct {
-		bytes int
-		re    *regexp.Regexp
-	}{
-		{fileIDBytes, regexp.MustCompile(`^[a-z2-7]{13}$`)},
-		{shortCodeBytes, regexp.MustCompile(`^[a-z2-7]{13}$`)},
-	}
-	for _, tc := range tests {
+	for _, length := range []int{minHashLength, 7, defaultHashLength, shortCodeLength, maxHashLength} {
+		re := regexp.MustCompile(fmt.Sprintf(`^[a-z2-7]{%d}$`, length))
 		seen := make(map[string]bool)
 		for range 10000 {
-			id := randomID(tc.bytes)
-			if !tc.re.MatchString(id) {
-				t.Fatalf("id %q does not match %s", id, tc.re)
+			id := randomID(length)
+			if !re.MatchString(id) {
+				t.Fatalf("id %q does not match %s", id, re)
 			}
-			if seen[id] {
+			// Short IDs collide by the birthday bound; only check wide ones.
+			if length >= defaultHashLength && seen[id] {
 				t.Fatalf("duplicate id %q", id)
 			}
 			seen[id] = true
@@ -252,10 +248,13 @@ func TestCapabilities(t *testing.T) {
 
 	t.Run("from .env", func(t *testing.T) {
 		env := filepath.Join(t.TempDir(), ".env")
-		os.WriteFile(env, []byte("USERNAME=a\nPASSWORD=b\nMAX_FILE_SIZE_MB=5\nDEFAULT_TTL_HOURS=1.5\nMAX_TTL_HOURS=24\nALLOW_PERMANENT=false\nMAX_FILES_PER_REQUEST=3\n"), 0644)
+		os.WriteFile(env, []byte("USERNAME=a\nPASSWORD=b\nMAX_FILE_SIZE_MB=5\nDEFAULT_TTL_HOURS=1.5\nMAX_TTL_HOURS=24\nALLOW_PERMANENT=false\nMAX_FILES_PER_REQUEST=3\nHASH_LENGTH=8\n"), 0644)
 		cfg, err := loadConfig(env)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if cfg.HashLength != 8 {
+			t.Errorf("HashLength = %d, want 8", cfg.HashLength)
 		}
 		caps := getCapabilities(t, newTestServer(t, cfg))
 		if caps["maxFileSizeBytes"] != float64(5<<20) || caps["maxFilesPerRequest"] != 3.0 ||
@@ -265,7 +264,7 @@ func TestCapabilities(t *testing.T) {
 	})
 
 	t.Run("invalid .env", func(t *testing.T) {
-		for _, extra := range []string{"MAX_FILES_PER_REQUEST=0", "DEFAULT_TTL_HOURS=abc", "ALLOW_PERMANENT=maybe", "DEFAULT_TTL_HOURS=5\nMAX_TTL_HOURS=2"} {
+		for _, extra := range []string{"MAX_FILES_PER_REQUEST=0", "DEFAULT_TTL_HOURS=abc", "ALLOW_PERMANENT=maybe", "DEFAULT_TTL_HOURS=5\nMAX_TTL_HOURS=2", "HASH_LENGTH=3", "HASH_LENGTH=65"} {
 			env := filepath.Join(t.TempDir(), ".env")
 			os.WriteFile(env, []byte("USERNAME=a\nPASSWORD=b\n"+extra+"\n"), 0644)
 			if _, err := loadConfig(env); err == nil {
